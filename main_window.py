@@ -1,4 +1,5 @@
-﻿import os
+﻿from __future__ import annotations
+import os
 import re
 import sys
 import time
@@ -44,7 +45,12 @@ TARGET_TOL_C = 0.5
 TARGET_HOLD_S = 20.0
 MAX_RAMP_RECOVERIES = 2
 SERIAL_PROBE_TIMEOUT_S = 0.1
+PRESS_CONTROL_SLAVE = 2
 FNAME_RE = re.compile(r"^T(\\d{4})(CH[1-4](?:CH[1-4])*)?\\.CSV$", re.IGNORECASE)
+
+
+class TaskStoppedError(Exception):
+    pass
 
 
 class ChannelDialog(QDialog):
@@ -378,6 +384,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.idn = None
         self.allowed_avg_counts = [2, 4, 8, 16, 32, 64, 128, 256, 512]
         self.control_slave = 1
+        self.press_control_slave = PRESS_CONTROL_SLAVE
         self.ramp_target_temp = None
         self.ramp_rate_cpm = None
         self.reach_inband_since = None
@@ -387,7 +394,24 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.hotplate_guard_timer = QTimer(self)
         self.hotplate_guard_timer.setInterval(1200)
         self.hotplate_guard_timer.timeout.connect(self.check_hotplate_ramp_guard)
+        self.hotplate_live_timer = QTimer(self)
+        self.hotplate_live_timer.setInterval(1000)
+        self.hotplate_live_timer.timeout.connect(self.poll_hotplate_live_data)
+        self.hotplate_live_err_suppressed = False
+        self.last_live_tc = None
+        self.last_live_pk = None
+        self.live_temp_since = None
+        self.live_press_since = None
+        self.live_temp_stable = False
+        self.live_press_stable = False
         self.detect_thread = None
+        self._ui_init_done = False
+        self.stop_requested = threading.Event()
+        self.sensor_log_file_path = None
+        self.status_log_file_path = None
+        self.data_log_enabled = False
+        self._log_write_err_reported = False
+        self.info_fit_window = None
 
         self.channel_btn = QPushButton()
         self._update_channel_button_text()
@@ -420,22 +444,36 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.browse_btn.clicked.connect(self.choose_path)
         self.init_btn.clicked.connect(self.initialize_system)
         self.start_btn.clicked.connect(self.do_save)
+        self.stop_btn.clicked.connect(self.request_task_stop)
         self.avg_checkbox.toggled.connect(self.on_avg_toggled)
+        self.single_mode_btn.toggled.connect(self.on_capture_mode_toggled)
+        self.avg_count_combo.currentIndexChanged.connect(self.on_avg_count_changed)
         self.hotplate_hold_btn.clicked.connect(self.send_hotplate_hold)
         self.hotplate_ramp_btn.clicked.connect(self.send_hotplate_ramp)
         self.hotplate_stop_btn.clicked.connect(self.send_hotplate_stop)
+        self.hotplate_phold_btn.clicked.connect(self.send_hotplate_press_hold)
+        self.hotplate_pramp_btn.clicked.connect(self.send_hotplate_press_ramp)
+        self.hotplate_pstop_btn.clicked.connect(self.send_hotplate_press_stop)
+        self.fit_settings_btn.clicked.connect(self.open_lifetime_fit_settings)
+        self.fit_enable_btn.toggled.connect(self.on_fit_enable_toggled)
 
         self.on_avg_toggled(self.avg_checkbox.isChecked())
 
+        self.load_port_settings()
         self.load_saved_path()
+        self.load_fit_enable_setting()
         self.settings_button.hide()
+        self._ui_init_done = True
         self.append_status("[系统] 已加载主窗口")
 
     def append_status(self, text: str):
-        self._append_log(self.status_log_text, text)
+        line = self._append_log(self.status_log_text, text)
+        self._write_log_line(self.status_log_file_path, line)
 
     def append_data(self, text: str):
-        self._append_log(self.sensor_log_text, text)
+        line = self._append_log(self.sensor_log_text, text)
+        if self.data_log_enabled:
+            self._write_log_line(self.sensor_log_file_path, line)
 
     def _append_log(self, widget, text: str, max_lines: int = 500):
         ts = time.strftime("%H:%M:%S")
@@ -448,14 +486,100 @@ class MainWindow(LaserLifetimeCalibrationUI):
             cursor.select(cursor.LineUnderCursor)
             cursor.removeSelectedText()
             cursor.deleteChar()
+        return line
+
+    def _write_log_line(self, file_path: str | None, line: str):
+        if not file_path:
+            return
+        try:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as ex:
+            if not self._log_write_err_reported:
+                self._log_write_err_reported = True
+                self.status_log_text.append(
+                    f"[{time.strftime('%H:%M:%S')}] [日志] 文件写入失败: {ex}"
+                )
+
+    def _init_run_log_files(self, save_dir: str):
+        self.sensor_log_file_path = os.path.join(save_dir, "温压状态日志.log")
+        self.status_log_file_path = os.path.join(save_dir, "运行事件日志.log")
+        self._log_write_err_reported = False
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        header = f"\n========== 自动寿命标定启动 {stamp} ==========\n"
+        for file_path in (self.sensor_log_file_path, self.status_log_file_path):
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(header)
 
     def _update_channel_button_text(self):
         self.channel_btn.setText("、".join(sorted(self.selected_channels)))
+
+    @staticmethod
+    def _collect_csv_files(folder: str):
+        if not folder or not os.path.isdir(folder):
+            return []
+        return [
+            os.path.join(folder, fn)
+            for fn in sorted(os.listdir(folder))
+            if fn.lower().endswith(".csv")
+        ]
+
+    def _get_or_create_info_fit_window(self):
+        if self.info_fit_window is None:
+            from info_app import mainWindow as InfoFitWindow
+            # Keep this as a top-level window to avoid inheriting main-window stylesheet.
+            self.info_fit_window = InfoFitWindow()
+        return self.info_fit_window
+
+    def _prepare_info_fit_context(self, save_dir: str):
+        win = self._get_or_create_info_fit_window()
+        csv_files = self._collect_csv_files(save_dir)
+        win.apply_external_context(work_dir=save_dir, save_dir=save_dir, target_files=csv_files)
+        return win, csv_files
+
+    def open_lifetime_fit_settings(self):
+        save_dir = self.save_path_edit.text().strip()
+        win, csv_files = self._prepare_info_fit_context(save_dir)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        self.append_status(f"[拟合] 已打开寿命拟合设置，CSV文件数量: {len(csv_files)}")
+
+    def load_fit_enable_setting(self):
+        enabled = self.settings.value("fit_after_run_enabled", True, type=bool)
+        self.fit_enable_btn.setChecked(bool(enabled))
+
+    def on_fit_enable_toggled(self, checked: bool):
+        self.settings.setValue("fit_after_run_enabled", bool(checked))
+        if self._ui_init_done:
+            state = "开启" if checked else "关闭"
+            self.append_status(f"[拟合] 自动后处理: {state}")
 
     def load_saved_path(self):
         saved = self.settings.value("save_dir", "", type=str)
         if saved and os.path.isdir(saved):
             self.save_path_edit.setText(saved)
+
+    def load_port_settings(self):
+        saved_scope = self.settings.value("scope_com_port", "", type=str).strip()
+        saved_hotplate = self.settings.value("hotplate_com_port", "", type=str).strip()
+        if saved_scope:
+            self.scope_com_port = saved_scope
+        if saved_hotplate:
+            self.hotplate_com_port = saved_hotplate
+        self.update_settings_tooltip()
+
+    def persist_port_settings(self):
+        scope_port = (self.scope_com_port or "").strip()
+        hotplate_port = (self.hotplate_com_port or "").strip()
+        if scope_port:
+            self.settings.setValue("scope_com_port", scope_port)
+        else:
+            self.settings.remove("scope_com_port")
+        if hotplate_port:
+            self.settings.setValue("hotplate_com_port", hotplate_port)
+        else:
+            self.settings.remove("hotplate_com_port")
 
     def persist_save_path(self):
         save_dir = self.save_path_edit.text().strip()
@@ -478,7 +602,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         scope_combo = QComboBox()
         grid.addWidget(scope_combo, 0, 1)
 
-        grid.addWidget(QLabel("加热台 COM口:"), 1, 0)
+        grid.addWidget(QLabel("标定台 COM口:"), 1, 0)
         hotplate_combo = QComboBox()
         grid.addWidget(hotplate_combo, 1, 1)
 
@@ -559,9 +683,34 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         self.scope_com_port = scope_combo.currentData() or self.scope_com_port
         self.hotplate_com_port = hotplate_combo.currentData() or self.hotplate_com_port
+        self.persist_port_settings()
         self.update_settings_tooltip()
-        self.append_status(f"[初始化] 示波器COM: {self.scope_com_port}, 加热台COM: {self.hotplate_com_port}")
-        self.try_lock_scope()
+        hot_ok, hot_sn = self.get_hotplate_identity_status()
+        self.start_hotplate_live_poll()
+        scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
+        self.append_status(
+            f"[初始化] 标定台: 端口={self.hotplate_com_port}, SN={hot_sn}, 连接={'是' if hot_ok else '否'}"
+        )
+        self.append_status(
+            f"[初始化] 示波器: 端口={self.scope_com_port}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
+        )
+
+    def _auto_initialize_for_start(self):
+        self.persist_port_settings()
+        self.update_settings_tooltip()
+
+        hot_ok, hot_sn = self.get_hotplate_identity_status()
+        if hot_ok:
+            self.start_hotplate_live_poll()
+        scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
+
+        self.append_status(
+            f"[自动初始化] 标定台: 端口={self.hotplate_com_port}, SN={hot_sn}, 连接={'是' if hot_ok else '否'}"
+        )
+        self.append_status(
+            f"[自动初始化] 示波器: 端口={self.scope_com_port}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
+        )
+        return scope_ok, hot_ok
 
     def _probe_port_once(self, port, baud, cmd):
         ser = None
@@ -623,8 +772,127 @@ class MainWindow(LaserLifetimeCalibrationUI):
             if scope_com and hotplate_com:
                 break
 
-        msg = f"自动检测完成: 示波器={scope_com or '未找到'}, 加热台={hotplate_com or '未找到'}"
+        msg = f"自动检测完成: 示波器={scope_com or '未找到'}, 标定台={hotplate_com or '未找到'}"
         return {"scope_com": scope_com, "hotplate_com": hotplate_com, "message": msg}
+
+    def start_hotplate_live_poll(self):
+        if serial is None:
+            return
+        if not (self.hotplate_com_port or "").strip():
+            return
+        if not self.hotplate_live_timer.isActive():
+            self.hotplate_live_timer.start()
+ 
+    def get_hotplate_identity_status(self):
+        if not (self.hotplate_com_port or "").strip():
+            return False, "未配置"
+        try:
+            idn, baud = self._query_hotplate("*IDN?")
+            if idn and "instec,mk2000b" in idn.lower():
+                parts = [x.strip() for x in idn.split(",")]
+                sn = parts[2] if len(parts) > 2 and parts[2] else idn
+                return True, sn
+            if idn:
+                parts = [x.strip() for x in idn.split(",")]
+                sn = parts[2] if len(parts) > 2 and parts[2] else idn
+                return True, sn
+            else:
+                rt, _ = self._query_hotplate("TEMPerature:RTINformation?")
+                if "MK:" in rt.upper():
+                    return True, "RTINformation可读"
+                return False, "未识别"
+        except Exception as ex:
+            return False, f"失败: {str(ex)[:32]}"
+
+    def poll_hotplate_live_data(self):
+        if not (self.hotplate_com_port or "").strip():
+            return
+        try:
+            rt_resp, _ = self._query_hotplate("TEMPerature:RTINformation?")
+            tc, pk, _, _, _, _ = self._extract_rt_channels(rt_resp, self.control_slave)
+            if tc is None or pk is None:
+                ftc, fpk = self._extract_temp_pressure_fallback(rt_resp)
+                if tc is None:
+                    tc = ftc
+                if pk is None:
+                    pk = fpk
+            if tc is None and pk is None:
+                return
+
+            if tc is not None and pk is not None:
+                try:
+                    self.push_hotplate_plot(tc, pk, float(self.hotplate_tf_spin.value()), float(self.hotplate_pf_spin.value()))
+                except Exception:
+                    pass
+
+            # Avoid writing exactly duplicated lines each second when values stay unchanged.
+            if (
+                self.last_live_tc is not None and self.last_live_pk is not None and
+                tc is not None and pk is not None and
+                abs(tc - self.last_live_tc) < 1e-6 and abs(pk - self.last_live_pk) < 1e-6
+            ):
+                return
+
+            self.last_live_tc = tc
+            self.last_live_pk = pk
+            tc_txt = f"{tc:.2f}" if tc is not None else "NA"
+            pk_txt = f"{pk:.3f}" if pk is not None else "NA"
+            self.append_data(f"{tc_txt} °C, {pk_txt} kPa")
+            self._update_live_stability_state(tc, pk)
+            self.hotplate_live_err_suppressed = False
+        except Exception as ex:
+            if not self.hotplate_live_err_suppressed:
+                self.append_status(f"[标定台] 实时日志采集失败，后续将抑制重复错误: {ex}")
+                self.hotplate_live_err_suppressed = True
+
+    def _update_live_stability_state(self, tc, pk):
+        need_temp = self.temp_cal_btn.isChecked()
+        need_press = self.press_cal_btn.isChecked()
+        now = time.time()
+
+        temp_target = float(self.ref_temp_spin.value())
+        press_target = float(self.ref_press_spin.value())
+        temp_tol = float(self.temp_fluc_spin.value())
+        press_tol = float(self.press_fluc_spin.value())
+        temp_hold_s = int(self.temp_stable_time_spin.value())
+        press_hold_s = int(self.press_stable_time_spin.value())
+
+        prev_temp_stable = self.live_temp_stable
+        prev_press_stable = self.live_press_stable
+
+        if need_temp and tc is not None and abs(tc - temp_target) <= temp_tol:
+            if self.live_temp_since is None:
+                self.live_temp_since = now
+        else:
+            self.live_temp_since = None
+
+        if need_press and pk is not None and abs(pk - press_target) <= press_tol:
+            if self.live_press_since is None:
+                self.live_press_since = now
+        else:
+            self.live_press_since = None
+
+        self.live_temp_stable = (not need_temp) or (temp_hold_s <= 0) or (
+            self.live_temp_since is not None and (now - self.live_temp_since) >= temp_hold_s
+        )
+        self.live_press_stable = (not need_press) or (press_hold_s <= 0) or (
+            self.live_press_since is not None and (now - self.live_press_since) >= press_hold_s
+        )
+
+        if need_temp and self.live_temp_stable != prev_temp_stable:
+            if self.live_temp_stable:
+                self.append_data("温度已稳定")
+            else:
+                self.append_data("温度离开稳定区")
+        if need_press and self.live_press_stable != prev_press_stable:
+            if self.live_press_stable:
+                self.append_data("压力已稳定")
+            else:
+                self.append_data("压力离开稳定区")
+
+        if (need_temp or need_press) and (self.live_temp_stable and self.live_press_stable):
+            if not (prev_temp_stable and prev_press_stable):
+                self.append_status("[监测] 温度、压力已稳定（实时监测）")
 
     def choose_path(self):
         d = QFileDialog.getExistingDirectory(self, "选择保存路径", self.save_path_edit.text().strip())
@@ -654,6 +922,23 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.avg_count_combo.setToolTip("仅在启用平均时生效")
             self.avg_count_label.setText("平均次数(已禁用):")
             self.avg_count_label.setStyleSheet("color: #8f99a5;")
+        if self._ui_init_done:
+            self.apply_scope_settings_now(reason="平均开关切换")
+
+    def on_capture_mode_toggled(self, checked: bool):
+        if not self._ui_init_done:
+            return
+        mode = "Single" if checked else "Continuous"
+        self.append_status(f"[示波器] 采样模式切换: {mode}")
+        self.apply_scope_settings_now(reason="采样模式切换")
+
+    def on_avg_count_changed(self, _index: int):
+        if not self._ui_init_done:
+            return
+        if not self.avg_checkbox.isChecked():
+            return
+        self.append_status(f"[示波器] 平均次数切换: {self.get_avg_count()}")
+        self.apply_scope_settings_now(reason="平均次数切换")
 
     def get_avg_count(self) -> int:
         value = self.avg_count_combo.currentData()
@@ -703,11 +988,38 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.append_status("[示波器] Acquire模式: SAMPLE")
         self.append_status(f"[示波器] 采样模式: {capture_mode}")
 
+    def apply_scope_settings_now(self, reason: str = "手动设置") -> bool:
+        if not self.resource_str:
+            return False
+        rm = scope = None
+        try:
+            rm, scope, _ = open_scope(self.resource_str)
+            self.apply_acquire_settings(scope)
+            self.append_status(f"[示波器] 参数已立即下发（{reason}）")
+            return True
+        except Exception as ex:
+            self.append_status(f"[示波器] 参数立即下发失败（{reason}）: {ex}")
+            return False
+        finally:
+            try:
+                if scope:
+                    scope.close()
+            except Exception:
+                pass
+            try:
+                if rm:
+                    rm.close()
+            except Exception:
+                pass
+
     def run_capture_once(self, scope, cycle_idx: int, total_cycles: int):
+        if self.stop_requested.is_set():
+            raise TaskStoppedError("用户已停止任务")
         capture_mode = self.get_capture_mode()
         _w(scope, "ACQ:STOPAFTER RUNST")
         _w(scope, "ACQ:STATE RUN")
         time.sleep(0.15)
+        QApplication.processEvents()
 
         if capture_mode == "CONTINUOUS":
             self.append_status(f"[循环 {cycle_idx}/{total_cycles}] 连续采样运行")
@@ -718,12 +1030,15 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         deadline = time.time() + 30.0
         while time.time() < deadline:
+            if self.stop_requested.is_set():
+                raise TaskStoppedError("用户已停止任务")
             acq = self.query_acquire_status(scope)
             is_running = acq["state"] == "1" and acq["trig_state"] != "SAVE"
             if not is_running:
                 self.append_status(f"[循环 {cycle_idx}/{total_cycles}] SINGLE完成, 触发状态={acq['trig_state']}")
                 return
             time.sleep(0.15)
+            QApplication.processEvents()
         raise RuntimeError(f"第 {cycle_idx} 次循环等待 SINGLE 完成超时")
 
     def with_scope(self):
@@ -732,105 +1047,309 @@ class MainWindow(LaserLifetimeCalibrationUI):
         rm, scope, _ = open_scope(self.resource_str)
         return rm, scope
 
-    def try_lock_scope(self):
+    def try_lock_scope(self, show_error=True, verbose=True):
         try:
             device_info = discover_scope_resource_robust(SERIAL_LOCK)
             self.resource_str = device_info["resource"]
             self.idn = device_info["idn"].strip()
-            self.append_status(f"[示波器] 已锁定 [{SERIAL_LOCK}]")
-            self.append_status(f"[示波器] 资源: {self.resource_str}")
-            self.append_status(f"[示波器] IDN: {self.idn}")
+            if verbose:
+                self.append_status(f"[示波器] 已锁定 [{SERIAL_LOCK}]")
+                self.append_status(f"[示波器] 资源: {self.resource_str}")
+                self.append_status(f"[示波器] IDN: {self.idn}")
+            parts = [x.strip() for x in self.idn.split(",")]
+            sn = parts[2] if len(parts) > 2 and parts[2] else self.idn
+            return True, sn
         except Exception as e:
             self.resource_str = None
             self.idn = None
-            QMessageBox.critical(self, "连接失败", f"无法锁定示波器（序列号 {SERIAL_LOCK}）\n\n{e}")
+            if verbose:
+                self.append_status(f"[示波器] 未连接或锁定失败: {e}")
+            if show_error:
+                QMessageBox.critical(self, "连接失败", f"无法锁定示波器（序列号 {SERIAL_LOCK}）\n\n{e}")
+            return False, "未连接"
+
+    @staticmethod
+    def _build_axis_values(start: float, step: float, end: float, name: str) -> list[float]:
+        if step <= 0:
+            raise RuntimeError(f"{name} 步进必须大于 0")
+        if end < start:
+            raise RuntimeError(f"{name} 终点必须大于等于起点（当前: {start} -> {end}）")
+
+        values: list[float] = []
+        cur = start
+        eps = max(abs(step) * 1e-9, 1e-9)
+        guard = 0
+        while cur <= end + eps:
+            values.append(round(cur, 6))
+            cur += step
+            guard += 1
+            if guard > 20000:
+                raise RuntimeError(f"{name} 阶段数量异常，请检查范围与步进")
+        return values
+
+    def _build_stage_targets(self) -> list[dict]:
+        need_temp = self.temp_cal_btn.isChecked()
+        need_press = self.press_cal_btn.isChecked()
+
+        temp_vals = [None]
+        press_vals = [None]
+        if need_temp:
+            temp_vals = self._build_axis_values(
+                float(self.temp_range_start_spin.value()),
+                float(self.temp_range_step_spin.value()),
+                float(self.temp_range_end_spin.value()),
+                "温度范围",
+            )
+        if need_press:
+            press_vals = self._build_axis_values(
+                float(self.press_range_start_spin.value()),
+                float(self.press_range_step_spin.value()),
+                float(self.press_range_end_spin.value()),
+                "压力范围",
+            )
+
+        if need_temp and need_press:
+            stage_count = max(len(temp_vals), len(press_vals))
+            if len(temp_vals) != len(press_vals):
+                self.append_status(
+                    f"[阶段] 温度阶段数={len(temp_vals)}，压力阶段数={len(press_vals)}，将对较短轴保持末值补齐到 {stage_count} 阶段"
+                )
+            stages = []
+            for i in range(stage_count):
+                stages.append(
+                    {
+                        "temp": float(temp_vals[min(i, len(temp_vals) - 1)]),
+                        "press": float(press_vals[min(i, len(press_vals) - 1)]),
+                    }
+                )
+            return stages
+
+        if need_temp:
+            return [{"temp": float(v), "press": None} for v in temp_vals]
+        if need_press:
+            return [{"temp": None, "press": float(v)} for v in press_vals]
+        return [{"temp": None, "press": None}]
+
+    def _apply_stage_setpoints(self, temp_target: float | None, press_target: float | None):
+        if temp_target is not None:
+            self.ref_temp_spin.setValue(temp_target)
+            self.hotplate_tf_spin.setValue(temp_target)
+            mode = self.temp_mode_combo.currentData() or "RAMP"
+            rate = float(self.temp_auto_rate_spin.value())
+            self.hotplate_rate_spin.setValue(rate)
+            if mode == "RAMP":
+                self._send_hotplate_commands(
+                    [
+                        f"TEMPerature:OPSLave {self.control_slave}",
+                        f"TEMPerature:RAMP {temp_target},{rate}",
+                    ]
+                )
+                self.ramp_target_temp = temp_target
+                self.ramp_rate_cpm = rate
+                self.reach_inband_since = None
+                self.reach_confirmed = False
+                self.last_hotplate_s_status = None
+                self.ramp_recovery_count = 0
+                self.hotplate_guard_timer.start()
+                self.append_status(f"[阶段] 温度设定: RAMP -> {temp_target:.2f} ℃ @ {rate:.2f} ℃/min")
+            else:
+                self._send_hotplate_commands(
+                    [
+                        f"TEMPerature:OPSLave {self.control_slave}",
+                        f"TEMPerature:HOLD {temp_target}",
+                    ]
+                )
+                self._reset_ramp_guard_state()
+                self.append_status(f"[阶段] 温度设定: HOLD -> {temp_target:.2f} ℃")
+
+        if press_target is not None:
+            self.ref_press_spin.setValue(press_target)
+            self.hotplate_pf_spin.setValue(press_target)
+            mode = self.press_mode_combo.currentData() or "RAMP"
+            rate = float(self.press_auto_rate_spin.value())
+            self.hotplate_prate_spin.setValue(rate)
+            if mode == "RAMP":
+                self._send_hotplate_commands(
+                    [
+                        f"TEMPerature:OPSLave {self.press_control_slave}",
+                        f"TEMPerature:RAMP {press_target},{rate}",
+                    ]
+                )
+                self.append_status(f"[阶段] 压力设定: RAMP -> {press_target:.2f} kPa @ {rate:.2f} kPa/min")
+            else:
+                self._send_hotplate_commands(
+                    [
+                        f"TEMPerature:OPSLave {self.press_control_slave}",
+                        f"TEMPerature:HOLD {press_target}",
+                    ]
+                )
+                self.append_status(f"[阶段] 压力设定: HOLD -> {press_target:.2f} kPa")
+
+    def _run_scope_cycles_for_stage(self, scope, save_dir: str, start_idx: int, cycles: int, stage_idx: int, stage_total: int):
+        capture_mode = self.get_capture_mode()
+        saved_files = []
+        for n in range(cycles):
+            if self.stop_requested.is_set():
+                raise TaskStoppedError("用户已停止任务")
+            cycle_no = n + 1
+            if capture_mode == "SINGLE":
+                self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] RUN -> SINGLE")
+            else:
+                self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] RUN")
+            self.run_capture_once(scope, cycle_no, cycles)
+            _w(scope, "ACQ:STATE STOP")
+            time.sleep(0.25)
+
+            csv_data = {}
+            base_time = None
+            idx = start_idx + n
+            csv_path = os.path.join(save_dir, make_filename(idx, self.selected_channels))
+
+            for ch in sorted(self.selected_channels):
+                if self.stop_requested.is_set():
+                    raise TaskStoppedError("用户已停止任务")
+                t, v, meta = read_waveform(scope, ch)
+                if base_time is None:
+                    base_time = t
+                    csv_data["TIME"] = t
+                else:
+                    if len(t) != len(base_time) or not np.allclose(t, base_time, rtol=0.0, atol=1e-15):
+                        raise RuntimeError(f"{ch} 的时间轴与其他通道不一致，已停止合并保存")
+
+                csv_data[ch] = v
+                self.append_status(
+                    f"[阶段{stage_idx}][循环{cycle_no}][{ch}] {meta['composition']} width={meta['width']} dtype={meta['dtype']} "
+                    f"BYT_OR={meta['byt_or']} BN_FMT={meta['bn_fmt']} ENC={meta['data_enc']}"
+                )
+                QApplication.processEvents()
+
+            save_csv(csv_path, csv_data)
+            saved_files.append(csv_path)
+            self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] SAVE完成: {csv_path}")
+            QApplication.processEvents()
+        return saved_files, start_idx + cycles
+
+    def request_task_stop(self):
+        self.stop_requested.set()
+        self.append_status("[任务] 已请求停止，正在安全结束当前步骤...")
+        self._stop_hotplate_and_live_plot("手动停止")
+
+    def _stop_hotplate_and_live_plot(self, reason: str = "流程结束"):
+        try:
+            self._send_hotplate_commands(
+                [
+                    f"TEMPerature:OPSLave {self.control_slave}",
+                    "TEMPerature:STOP",
+                    f"TEMPerature:OPSLave {self.press_control_slave}",
+                    "TEMPerature:STOP",
+                ]
+            )
+            self.append_status(f"[标定台] 已自动发送 STOP（{reason}）")
+        except Exception as ex:
+            self.append_status(f"[标定台] STOP 发送失败（{reason}）: {ex}")
+        if self.hotplate_live_timer.isActive():
+            self.hotplate_live_timer.stop()
+            self.append_status("[标定台] 实时曲线已停止刷新")
 
     def do_save(self):
+        if not self.start_btn.isChecked():
+            return
+        self.stop_requested.clear()
         save_dir = self.save_path_edit.text().strip()
         if save_dir and not os.path.isdir(save_dir):
             try:
                 os.makedirs(save_dir, exist_ok=True)
             except Exception:
                 QMessageBox.warning(self, "提示", "保存路径无效，请重新选择")
+                self.start_btn.setChecked(False)
                 return
 
         if not save_dir:
             QMessageBox.warning(self, "提示", "请先选择保存路径")
-            return
-        if not self.resource_str:
-            QMessageBox.warning(self, "提示", "示波器未锁定，无法保存")
+            self.start_btn.setChecked(False)
             return
 
-        try:
-            self.wait_for_temp_press_stable()
-        except Exception as ex:
-            QMessageBox.critical(self, "稳定等待失败", str(ex))
+        scope_ok, hot_ok = self._auto_initialize_for_start()
+        if not scope_ok:
+            QMessageBox.warning(self, "提示", "示波器未连接，无法开始")
+            self.start_btn.setChecked(False)
+            return
+        if (self.temp_cal_btn.isChecked() or self.press_cal_btn.isChecked()) and not hot_ok:
+            QMessageBox.warning(self, "提示", "标定台未连接，无法开始")
+            self.start_btn.setChecked(False)
             return
 
         rm = scope = None
         try:
+            self._init_run_log_files(save_dir)
+            self.data_log_enabled = True
+            self.append_data("自动寿命标定开始")
+            self.append_status("自动寿命标定开始")
+            stages = self._build_stage_targets()
+            cycles = int(self.cycles_spin.value())
+            if cycles < 1:
+                raise RuntimeError("循环次数必须大于等于 1")
+
             rm, scope, _ = open_scope(self.resource_str)
             clear_session(scope)
             self.apply_acquire_settings(scope)
 
             self.persist_save_path()
             start_idx = next_index(save_dir)
-            cycles = int(self.cycles_spin.value())
-            if cycles < 1:
-                raise RuntimeError("循环次数必须大于等于 1")
 
             capture_mode = self.get_capture_mode()
-            if capture_mode == "SINGLE":
-                self.append_status(f"[任务] 开始执行 RUN-SINGLE-SAVE，共 {cycles} 次")
-            else:
-                self.append_status(f"[任务] 开始执行 RUN-SAVE，共 {cycles} 次")
+            self.append_status(
+                f"[任务] 自动流程启动: 阶段数={len(stages)}, 每阶段循环={cycles}, 模式={capture_mode}"
+            )
+
             saved_files = []
+            stage_total = len(stages)
+            for i, stage in enumerate(stages, start=1):
+                if self.stop_requested.is_set():
+                    raise TaskStoppedError("用户已停止任务")
+                t_txt = "保持当前" if stage["temp"] is None else f"{stage['temp']:.2f}℃"
+                p_txt = "保持当前" if stage["press"] is None else f"{stage['press']:.2f}kPa"
+                self.append_status(f"[阶段 {i}/{stage_total}] 目标: 温度={t_txt}, 压力={p_txt}")
 
-            for n in range(cycles):
-                cycle_no = n + 1
-                if capture_mode == "SINGLE":
-                    self.append_status(f"[循环 {cycle_no}/{cycles}] RUN -> SINGLE")
-                else:
-                    self.append_status(f"[循环 {cycle_no}/{cycles}] RUN")
-                self.run_capture_once(scope, cycle_no, cycles)
-                _w(scope, "ACQ:STATE STOP")
-                time.sleep(0.25)
+                self._apply_stage_setpoints(stage["temp"], stage["press"])
+                self.wait_for_temp_press_stable()
+                stage_files, start_idx = self._run_scope_cycles_for_stage(
+                    scope, save_dir, start_idx, cycles, i, stage_total
+                )
+                saved_files.extend(stage_files)
 
-                csv_data = {}
-                base_time = None
-                idx = start_idx + n
-                csv_path = os.path.join(save_dir, make_filename(idx, self.selected_channels))
-
-                for ch in sorted(self.selected_channels):
-                    t, v, meta = read_waveform(scope, ch)
-                    if base_time is None:
-                        base_time = t
-                        csv_data["TIME"] = t
-                    else:
-                        if len(t) != len(base_time) or not np.allclose(t, base_time, rtol=0.0, atol=1e-15):
-                            raise RuntimeError(f"{ch} 的时间轴与其他通道不一致，已停止合并保存")
-
-                    csv_data[ch] = v
-                    self.append_status(
-                        f"[循环{cycle_no}][{ch}] {meta['composition']} width={meta['width']} dtype={meta['dtype']} "
-                        f"BYT_OR={meta['byt_or']} BN_FMT={meta['bn_fmt']} ENC={meta['data_enc']}"
-                    )
-
-                save_csv(csv_path, csv_data)
-                saved_files.append(csv_path)
-                self.append_status(f"[循环 {cycle_no}/{cycles}] SAVE完成: {csv_path}")
+            self._stop_hotplate_and_live_plot("流程完成")
 
             summary = "\n".join(saved_files[:6])
             if len(saved_files) > 6:
                 summary += f"\n... 共 {len(saved_files)} 个文件"
-            if capture_mode == "SINGLE":
-                QMessageBox.information(self, "保存完成", f"已完成 {cycles} 次 RUN-SINGLE-SAVE\n{summary}")
+            QMessageBox.information(
+                self,
+                "保存完成",
+                f"已完成 {stage_total} 个阶段，每阶段 {cycles} 次采集\n{summary}",
+            )
+            if self.fit_enable_btn.isChecked():
+                self.append_status("[后处理] 自动启动寿命拟合全部文件结果保存")
+                fit_win, csv_files = self._prepare_info_fit_context(save_dir)
+                fit_win.show()
+                fit_win.raise_()
+                fit_win.activateWindow()
+                if csv_files:
+                    fit_win.auto_run_save_all()
+                else:
+                    self.append_status("[后处理] 未找到CSV文件，已跳过寿命拟合保存")
             else:
-                QMessageBox.information(self, "保存完成", f"已完成 {cycles} 次 RUN-SAVE\n{summary}")
+                self.append_status("[后处理] 已关闭自动寿命拟合，跳过全部文件结果保存")
 
+        except TaskStoppedError:
+            QMessageBox.information(self, "任务已停止", "自动流程已按请求停止。")
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"{e}\n\n{traceback.format_exc()}")
         finally:
+            self.start_btn.setChecked(False)
+            self.data_log_enabled = False
+            self.sensor_log_file_path = None
+            self.status_log_file_path = None
             try:
                 if scope:
                     scope.close()
@@ -847,7 +1366,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             raise RuntimeError("未安装 pyserial，请先执行: pip install pyserial")
         port = (self.hotplate_com_port or "").strip()
         if not port:
-            raise RuntimeError("未配置加热台 COM 口，请先在 menu-settings 中设置")
+            raise RuntimeError("未配置标定台 COM 口，请先在 menu-settings 中设置")
 
         errors = []
         for baud in HOTPLATE_BAUD_CANDIDATES:
@@ -878,14 +1397,14 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         ser.close()
                 except Exception:
                     pass
-        raise RuntimeError(f"加热台命令发送失败: {port}\n" + "\n".join(errors))
+        raise RuntimeError(f"标定台命令发送失败: {port}\n" + "\n".join(errors))
 
     def _query_hotplate(self, command: str):
         if serial is None:
             raise RuntimeError("未安装 pyserial，请先执行: pip install pyserial")
         port = (self.hotplate_com_port or "").strip()
         if not port:
-            raise RuntimeError("未配置加热台 COM 口，请先在 menu-settings 中设置")
+            raise RuntimeError("未配置标定台 COM 口，请先在 menu-settings 中设置")
 
         errors = []
         for baud in HOTPLATE_BAUD_CANDIDATES:
@@ -927,7 +1446,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         ser.close()
                 except Exception:
                     pass
-        raise RuntimeError(f"加热台查询失败: {port}\n" + "\n".join(errors))
+        raise RuntimeError(f"标定台查询失败: {port}\n" + "\n".join(errors))
 
     @staticmethod
     def _extract_rt_channels(resp: str, control_slave: int = 1):
@@ -1015,11 +1534,16 @@ class MainWindow(LaserLifetimeCalibrationUI):
         press_since = None
         last_log_ts = 0.0
 
-        self.append_status(
-            f"[稳定等待] 启动: 温度目标={temp_target:.2f}±{temp_tol:.2f}, 压力目标={press_target:.2f}±{press_tol:.2f}"
-        )
+        parts = []
+        if need_temp:
+            parts.append(f"温度目标={temp_target:.2f}±{temp_tol:.2f}")
+        if need_press:
+            parts.append(f"压力目标={press_target:.2f}±{press_tol:.2f}")
+        self.append_status(f"[稳定等待] 启动: {', '.join(parts)}")
 
         while True:
+            if self.stop_requested.is_set():
+                raise TaskStoppedError("用户已停止任务")
             rt_resp, _ = self._query_hotplate("TEMPerature:RTINformation?")
             tc, pk, _, _, _, _ = self._extract_rt_channels(rt_resp, self.control_slave)
             if tc is None or pk is None:
@@ -1045,26 +1569,26 @@ class MainWindow(LaserLifetimeCalibrationUI):
             temp_ok = (not need_temp) or (temp_hold_s <= 0) or (temp_since is not None and (now - temp_since) >= temp_hold_s)
             press_ok = (not need_press) or (press_hold_s <= 0) or (press_since is not None and (now - press_since) >= press_hold_s)
 
-            if need_temp:
-                self.current_temp_display.setText("稳定" if temp_ok else "待稳")
-            else:
-                self.current_temp_display.setText("已关闭")
-            if need_press:
-                self.current_press_display.setText("稳定" if press_ok else "待稳")
-            else:
-                self.current_press_display.setText("已关闭")
-
             if now - last_log_ts >= 1.0:
-                temp_prog = 0.0 if temp_since is None else max(0.0, now - temp_since)
-                press_prog = 0.0 if press_since is None else max(0.0, now - press_since)
-                self.append_data(
-                    f"温度={tc if tc is not None else 'NA'} °C, 压力={pk if pk is not None else 'NA'} kPa, "
-                    f"温稳进度={temp_prog:.1f}/{temp_hold_s}s, 压稳进度={press_prog:.1f}/{press_hold_s}s"
-                )
+                fields = []
+                if need_temp:
+                    temp_prog = 0.0 if temp_since is None else max(0.0, now - temp_since)
+                    fields.append(f"温度={tc if tc is not None else 'NA'} °C")
+                    fields.append(f"温稳进度={temp_prog:.1f}/{temp_hold_s}s")
+                if need_press:
+                    press_prog = 0.0 if press_since is None else max(0.0, now - press_since)
+                    fields.append(f"压力={pk if pk is not None else 'NA'} kPa")
+                    fields.append(f"压稳进度={press_prog:.1f}/{press_hold_s}s")
+                self.append_data(", ".join(fields))
                 last_log_ts = now
 
             if temp_ok and press_ok:
-                self.append_status("[稳定等待] 温度、压力均已满足稳定时间，开始示波器保存流程")
+                if need_temp and need_press:
+                    self.append_status("[稳定等待] 温度、压力均已满足稳定时间，开始示波器保存流程")
+                elif need_temp:
+                    self.append_status("[稳定等待] 温度已满足稳定时间，开始示波器保存流程")
+                else:
+                    self.append_status("[稳定等待] 压力已满足稳定时间，开始示波器保存流程")
                 return
 
             QApplication.processEvents()
@@ -1099,7 +1623,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             if (not self.reach_confirmed) and inband_sec >= TARGET_HOLD_S:
                 self.reach_confirmed = True
                 self.append_status(
-                    f"[加热台] RAMP达标: |TC-TF| <= {TARGET_TOL_C:.1f}℃ 持续 {TARGET_HOLD_S:.0f}s"
+                    f"[标定台] RAMP达标: |TC-TF| <= {TARGET_TOL_C:.1f}℃ 持续 {TARGET_HOLD_S:.0f}s"
                 )
 
     def check_hotplate_ramp_guard(self):
@@ -1125,41 +1649,46 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         ]
                     )
                     self.append_status(
-                        f"[加热台] 检测到RAMP中断(未达标), 自动重发RAMP "
+                        f"[标定台] 检测到RAMP中断(未达标), 自动重发RAMP "
                         f"({self.ramp_recovery_count}/{MAX_RAMP_RECOVERIES}) [{baud}bps]"
                     )
                 else:
                     self.append_status(
-                        f"[加热台] 警告: RAMP中断且自动恢复已达上限, err={err_code}"
+                        f"[标定台] 警告: RAMP中断且自动恢复已达上限, err={err_code}"
                     )
             self.last_hotplate_s_status = s_status
 
             if self.reach_confirmed and s_status in (0, 1):
-                self.append_status("[加热台] 达标后已进入稳定/停止状态，停止RAMP监控")
+                self.append_status("[标定台] 达标后已进入稳定/停止状态，停止RAMP监控")
                 self.hotplate_guard_timer.stop()
 
         except Exception as ex:
-            self.append_status(f"[加热台] 监控查询失败: {ex}")
+            self.append_status(f"[标定台] 监控查询失败: {ex}")
 
     def send_hotplate_hold(self):
         tf = float(self.hotplate_tf_spin.value())
         try:
-            baud = self._send_hotplate_commands([f"TEMPerature:HOLD {tf}"])
+            self._send_hotplate_commands(
+                [
+                    f"TEMPerature:OPSLave {self.control_slave}",
+                    f"TEMPerature:HOLD {tf}",
+                ]
+            )
             self._reset_ramp_guard_state()
-            self.append_status(f"[加热台] HOLD 已发送: TF={tf:.2f} ℃ ({self.hotplate_com_port}, {baud}bps)")
+            self.append_status(f"[标定台] HOLD 已发送: TF={tf:.2f} ℃")
         except Exception as ex:
-            QMessageBox.critical(self, "加热台控制失败", str(ex))
+            QMessageBox.critical(self, "标定台控制失败", str(ex))
 
     def send_hotplate_ramp(self):
         tf = float(self.hotplate_tf_spin.value())
         rate = float(self.hotplate_rate_spin.value())
         if rate <= 0:
-            QMessageBox.warning(self, "加热台参数错误", "Rate 必须大于 0")
+            QMessageBox.warning(self, "标定台参数错误", "Rate 必须大于 0")
             return
         try:
-            baud = self._send_hotplate_commands(
+            self._send_hotplate_commands(
                 [
-                    "TEMPerature:OPSLave 1",
+                    f"TEMPerature:OPSLave {self.control_slave}",
                     f"TEMPerature:RAMP {tf},{rate}",
                 ]
             )
@@ -1171,18 +1700,65 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.ramp_recovery_count = 0
             self.hotplate_guard_timer.start()
             self.append_status(
-                f"[加热台] RAMP 已发送: TF={tf:.2f} ℃, Rate={rate:.2f} ℃/min ({self.hotplate_com_port}, {baud}bps)"
+                f"[标定台] RAMP 已发送: TF={tf:.2f} ℃, Rate={rate:.2f} ℃/min"
             )
         except Exception as ex:
-            QMessageBox.critical(self, "加热台控制失败", str(ex))
+            QMessageBox.critical(self, "标定台控制失败", str(ex))
 
     def send_hotplate_stop(self):
         try:
-            baud = self._send_hotplate_commands(["TEMPerature:STOP"])
+            self._send_hotplate_commands(
+                [
+                    f"TEMPerature:OPSLave {self.control_slave}",
+                    "TEMPerature:STOP",
+                ]
+            )
             self._reset_ramp_guard_state()
-            self.append_status(f"[加热台] STOP 已发送 ({self.hotplate_com_port}, {baud}bps)")
+            self.append_status("[标定台] STOP 已发送")
         except Exception as ex:
-            QMessageBox.critical(self, "加热台控制失败", str(ex))
+            QMessageBox.critical(self, "标定台控制失败", str(ex))
+
+    def send_hotplate_press_hold(self):
+        pf = float(self.hotplate_pf_spin.value())
+        try:
+            self._send_hotplate_commands(
+                [
+                    f"TEMPerature:OPSLave {self.press_control_slave}",
+                    f"TEMPerature:HOLD {pf}",
+                ]
+            )
+            self.append_status(f"[标定台] P-HOLD 已发送: PF={pf:.2f} kPa")
+        except Exception as ex:
+            QMessageBox.critical(self, "压力控制失败", str(ex))
+
+    def send_hotplate_press_ramp(self):
+        pf = float(self.hotplate_pf_spin.value())
+        prate = float(self.hotplate_prate_spin.value())
+        if prate <= 0:
+            QMessageBox.warning(self, "压力参数错误", "P-Rate 必须大于 0")
+            return
+        try:
+            self._send_hotplate_commands(
+                [
+                    f"TEMPerature:OPSLave {self.press_control_slave}",
+                    f"TEMPerature:RAMP {pf},{prate}",
+                ]
+            )
+            self.append_status(f"[标定台] P-RAMP 已发送: PF={pf:.2f} kPa, P-Rate={prate:.2f} kPa/min")
+        except Exception as ex:
+            QMessageBox.critical(self, "压力控制失败", str(ex))
+
+    def send_hotplate_press_stop(self):
+        try:
+            self._send_hotplate_commands(
+                [
+                    f"TEMPerature:OPSLave {self.press_control_slave}",
+                    "TEMPerature:STOP",
+                ]
+            )
+            self.append_status("[标定台] P-STOP 已发送")
+        except Exception as ex:
+            QMessageBox.critical(self, "压力控制失败", str(ex))
 
 
 def main():
@@ -1194,3 +1770,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

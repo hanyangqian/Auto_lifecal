@@ -1,4 +1,6 @@
-﻿import re
+﻿from __future__ import annotations
+
+import re
 import threading
 import time
 import tkinter as tk
@@ -19,6 +21,7 @@ PROBE_WAIT_S = 0.1
 POLL_WAIT_S = 0.35
 TARGET_TOL_C = 0.5
 TARGET_HOLD_S = 20.0
+PRESS_CONTROL_SLAVE = 2
 
 
 class TempControllerApp:
@@ -39,6 +42,7 @@ class TempControllerApp:
         self.active_baud: int | None = None
         self.cmd_term = "\r"
         self.control_slave = 1
+        self.press_control_slave = PRESS_CONTROL_SLAVE
 
         self.port_var = tk.StringVar(value="")
         self.sn_var = tk.StringVar(value="")
@@ -47,17 +51,26 @@ class TempControllerApp:
         self.pk_var = tk.StringVar(value="0.000")
         self.tf_var = tk.StringVar(value="25")
         self.rate_var = tk.StringVar(value="5")
+        self.pf_var = tk.StringVar(value="101.3")
+        self.prate_var = tk.StringVar(value="5")
         self.cmd_var = tk.StringVar(value="*IDN?")
         self.data_var = tk.StringVar(value="")
 
         self.t0 = time.time()
-        self.time_data: list[float] = []
+        self.temp_time_data: list[float] = []
         self.tc_data: list[float] = []
         self.tf_data: list[float] = []
+        self.press_time_data: list[float] = []
+        self.pk_data: list[float] = []
+        self.pf_data: list[float] = []
         self.sim_tf_current = 25.0
         self.sim_tf_target = 25.0
         self.sim_rate_cpm = 0.0
-        self.sim_mode = "hold"  # "hold" | "ramp" | "hold_rise"
+        self.sim_temp_mode = "hold"  # "hold" | "ramp"
+        self.sim_pf_current = 101.3
+        self.sim_pf_target = 101.3
+        self.sim_prate_kpm = 0.0
+        self.sim_press_mode = "hold"  # "hold" | "ramp"
         self.last_sim_ts = time.time()
         self.last_tc_value = 0.0
         self.last_pk_value = 0.0
@@ -83,34 +96,65 @@ class TempControllerApp:
         right = ttk.Frame(self.root, padding=(0, 10, 10, 10))
         right.grid(row=0, column=1, sticky="nsew")
 
-        ttk.Label(left, text="Virtual Com Port for MK2000 and MK2000B(SCPI)", font=("Segoe UI", 26, "bold")).pack(anchor="w", pady=(0, 8))
+        top_bar = ttk.Frame(left)
+        top_bar.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(
+            top_bar,
+            text="Virtual Com Port for MK2000 and MK2000B(SCPI)",
+            font=("Segoe UI", 26, "bold"),
+        ).pack(side=tk.LEFT, anchor="w")
 
-        fig = Figure(figsize=(8, 5), dpi=100)
-        self.ax = fig.add_subplot(111)
-        self.ax.set_facecolor("black")
-        fig.patch.set_facecolor("#d9d9d9")
-        self.ax.grid(color="#00aa00", linestyle="-", linewidth=0.6)
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Temperature")
-        self.line_tc, = self.ax.plot([], [], color="#ffffff", linewidth=1.8, marker="o", markersize=2.5, label="TC")
-        self.line_tf, = self.ax.plot([], [], color="#ff5555", linewidth=1.8, marker="o", markersize=2.5, label="TF")
-        self.ax.legend(loc="upper right")
-        self.canvas = FigureCanvasTkAgg(fig, master=left)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.chart_tabs = ttk.Notebook(left)
+        self.chart_tabs.pack(fill=tk.BOTH, expand=True)
+
+        self.temp_page = ttk.Frame(self.chart_tabs)
+        temp_fig = Figure(figsize=(8, 5), dpi=100)
+        self.temp_ax = temp_fig.add_subplot(111)
+        self.temp_ax.set_facecolor("black")
+        temp_fig.patch.set_facecolor("#d9d9d9")
+        self.temp_ax.grid(color="#00aa00", linestyle="-", linewidth=0.6)
+        self.temp_ax.set_xlabel("Time (s)")
+        self.temp_ax.set_ylabel("Temperature (C)")
+        self.line_tc, = self.temp_ax.plot([], [], color="#ffffff", linewidth=1.8, marker="o", markersize=2.5, label="TC")
+        self.line_tf, = self.temp_ax.plot([], [], color="#ff5555", linewidth=1.8, marker="o", markersize=2.5, label="TF")
+        self.temp_ax.legend(loc="upper right")
+        self.temp_canvas = FigureCanvasTkAgg(temp_fig, master=self.temp_page)
+        self.temp_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self.press_page = ttk.Frame(self.chart_tabs)
+        press_fig = Figure(figsize=(8, 5), dpi=100)
+        self.press_ax = press_fig.add_subplot(111)
+        self.press_ax.set_facecolor("black")
+        press_fig.patch.set_facecolor("#d9d9d9")
+        self.press_ax.grid(color="#00aa00", linestyle="-", linewidth=0.6)
+        self.press_ax.set_xlabel("Time (s)")
+        self.press_ax.set_ylabel("Pressure (kPa)")
+        self.line_pk, = self.press_ax.plot([], [], color="#66ccff", linewidth=1.8, marker="o", markersize=2.5, label="PK")
+        self.line_pf, = self.press_ax.plot([], [], color="#ffaa44", linewidth=1.8, marker="o", markersize=2.5, label="PF")
+        self.press_ax.legend(loc="upper right")
+        self.press_canvas = FigureCanvasTkAgg(press_fig, master=self.press_page)
+        self.press_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.chart_tabs.add(self.temp_page, text="温度曲线图")
+        self.chart_tabs.add(self.press_page, text="压力曲线图")
 
         sec_port = ttk.LabelFrame(right, text="Com Port select", padding=10)
         sec_port.pack(fill=tk.X, pady=(0, 8))
         self.port_combo = ttk.Combobox(sec_port, textvariable=self.port_var, state="readonly")
-        self.port_combo.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        self.port_combo.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 8))
         sec_port.grid_columnconfigure(0, weight=1)
+        sec_port.grid_columnconfigure(1, weight=1)
+        sec_port.grid_columnconfigure(2, weight=1)
+        sec_port.grid_columnconfigure(3, weight=1)
         self.btn_refresh = ttk.Button(sec_port, text="Refresh", command=lambda: self.refresh_ports(auto_select=False))
         self.btn_refresh.grid(row=1, column=0, sticky="ew")
         self.btn_connect = ttk.Button(sec_port, text="Connect", command=self.connect)
         self.btn_connect.grid(row=1, column=1, sticky="ew", padx=4)
         self.btn_auto = ttk.Button(sec_port, text="Auto Detect", command=self.auto_detect_and_connect)
         self.btn_auto.grid(row=1, column=2, sticky="ew")
+        self.btn_disconnect = ttk.Button(sec_port, text="Disconnect", command=self.disconnect)
+        self.btn_disconnect.grid(row=1, column=3, sticky="ew")
         ttk.Label(sec_port, text="SN").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(sec_port, textvariable=self.sn_var, state="readonly").grid(row=3, column=0, columnspan=3, sticky="ew")
+        ttk.Entry(sec_port, textvariable=self.sn_var, state="readonly").grid(row=3, column=0, columnspan=4, sticky="ew")
 
         sec_tc = ttk.LabelFrame(right, text="Current", padding=10)
         sec_tc.pack(fill=tk.X, pady=(0, 8))
@@ -121,14 +165,28 @@ class TempControllerApp:
 
         sec_ctrl = ttk.LabelFrame(right, text="Control", padding=10)
         sec_ctrl.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(sec_ctrl, text="TF").grid(row=0, column=0, sticky="w")
-        ttk.Entry(sec_ctrl, textvariable=self.tf_var, width=10).grid(row=0, column=1, sticky="w")
-        ttk.Button(sec_ctrl, text="Hold", command=self.send_hold).grid(row=0, column=2, sticky="ew", padx=(10, 0))
-        ttk.Label(sec_ctrl, text="Rate").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(sec_ctrl, textvariable=self.rate_var, width=10).grid(row=1, column=1, sticky="w", pady=(8, 0))
-        ttk.Button(sec_ctrl, text="Ramp", command=self.send_ramp).grid(row=1, column=2, sticky="ew", padx=(10, 0), pady=(8, 0))
-        ttk.Button(sec_ctrl, text="Stop", command=self.send_stop).grid(row=2, column=2, sticky="ew", padx=(10, 0), pady=(8, 0))
-        ttk.Button(sec_ctrl, text="Disconnect", command=self.disconnect).grid(row=3, column=2, sticky="ew", padx=(10, 0), pady=(8, 0))
+        sec_ctrl.grid_columnconfigure(0, weight=1)
+        sec_ctrl.grid_columnconfigure(1, weight=1)
+
+        temp_ctrl = ttk.LabelFrame(sec_ctrl, text="Temperature", padding=8)
+        temp_ctrl.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        ttk.Label(temp_ctrl, text="TF").grid(row=0, column=0, sticky="w")
+        ttk.Entry(temp_ctrl, textvariable=self.tf_var, width=10).grid(row=0, column=1, sticky="w")
+        ttk.Button(temp_ctrl, text="Hold", command=self.send_hold).grid(row=0, column=2, sticky="ew", padx=(10, 0))
+        ttk.Label(temp_ctrl, text="Rate").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(temp_ctrl, textvariable=self.rate_var, width=10).grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Button(temp_ctrl, text="Ramp", command=self.send_ramp).grid(row=1, column=2, sticky="ew", padx=(10, 0), pady=(8, 0))
+        ttk.Button(temp_ctrl, text="Stop", command=self.send_stop).grid(row=2, column=2, sticky="ew", padx=(10, 0), pady=(8, 0))
+
+        press_ctrl = ttk.LabelFrame(sec_ctrl, text="Pressure", padding=8)
+        press_ctrl.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        ttk.Label(press_ctrl, text="PF(kPa)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(press_ctrl, textvariable=self.pf_var, width=10).grid(row=0, column=1, sticky="w")
+        ttk.Button(press_ctrl, text="P-Hold", command=self.send_press_hold).grid(row=0, column=2, sticky="ew", padx=(10, 0))
+        ttk.Label(press_ctrl, text="P-Rate").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(press_ctrl, textvariable=self.prate_var, width=10).grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Button(press_ctrl, text="P-Ramp", command=self.send_press_ramp).grid(row=1, column=2, sticky="ew", padx=(10, 0), pady=(8, 0))
+        ttk.Button(press_ctrl, text="P-Stop", command=self.send_press_stop).grid(row=2, column=2, sticky="ew", padx=(10, 0), pady=(8, 0))
 
         sec_cmd = ttk.LabelFrame(right, text="Command", padding=10)
         sec_cmd.pack(fill=tk.BOTH, expand=True)
@@ -178,22 +236,32 @@ class TempControllerApp:
         self.root.after(1200, self._schedule_status_refresh)
 
     def _schedule_plot_tick(self) -> None:
-        # Keep TF as simulated setpoint curve (hold or ramp in C/min), independent of device reply format.
+        # Keep TF/PF as simulated setpoint curves independent of device reply format.
         now = time.time()
         dt = max(0.0, now - self.last_sim_ts)
         self.last_sim_ts = now
 
-        if self.sim_mode in ("ramp", "hold_rise"):
+        if self.sim_temp_mode == "ramp":
             step = (self.sim_rate_cpm / 60.0) * dt
             if self.sim_tf_current < self.sim_tf_target:
                 self.sim_tf_current = min(self.sim_tf_current + step, self.sim_tf_target)
             else:
                 self.sim_tf_current = max(self.sim_tf_current - step, self.sim_tf_target)
             if abs(self.sim_tf_current - self.sim_tf_target) < 1e-6:
-                self.sim_mode = "hold"
+                self.sim_temp_mode = "hold"
+
+        if self.sim_press_mode == "ramp":
+            pstep = (self.sim_prate_kpm / 60.0) * dt
+            if self.sim_pf_current < self.sim_pf_target:
+                self.sim_pf_current = min(self.sim_pf_current + pstep, self.sim_pf_target)
+            else:
+                self.sim_pf_current = max(self.sim_pf_current - pstep, self.sim_pf_target)
+            if abs(self.sim_pf_current - self.sim_pf_target) < 1e-6:
+                self.sim_press_mode = "hold"
 
         # Keep curve alive even when no fresh poll arrives.
-        self._push_plot(self.last_tc_value, self.sim_tf_current)
+        self._push_temp_plot(self.last_tc_value, self.sim_tf_current)
+        self._push_press_plot(self.last_pk_value, self.sim_pf_current)
         self.root.after(int(PLOT_TICK_S * 1000), self._schedule_plot_tick)
 
     def is_connected(self) -> bool:
@@ -205,6 +273,7 @@ class TempControllerApp:
         self.btn_connect.configure(state=s)
         self.btn_auto.configure(state=s)
         self.btn_refresh.configure(state=s)
+        self.btn_disconnect.configure(state=s)
         self.port_combo.configure(state="disabled" if busy else "readonly")
 
     def _next_io_seq(self) -> int:
@@ -241,12 +310,39 @@ class TempControllerApp:
         for port in ports:
             if self._try_connect_port(port):
                 self.root.after(0, lambda p=port: self.port_var.set(p))
+                self.root.after(0, self._reset_plot_after_connect)
                 self.append_log(f"Connected on {port}")
                 self.start_polling()
                 self.root.after(0, lambda: self._set_connect_busy(False))
                 return
         self.append_log("No MK2000B found on scanned ports.")
         self.root.after(0, lambda: self._set_connect_busy(False))
+
+    def _reset_plot_after_connect(self) -> None:
+        self.t0 = time.time()
+        self.temp_time_data.clear()
+        self.tc_data.clear()
+        self.tf_data.clear()
+        self.press_time_data.clear()
+        self.pk_data.clear()
+        self.pf_data.clear()
+        self.line_tc.set_data([], [])
+        self.line_tf.set_data([], [])
+        self.line_pk.set_data([], [])
+        self.line_pf.set_data([], [])
+        self.temp_ax.set_xlim(0, 1)
+        self.press_ax.set_xlim(0, 1)
+        tf_now = self._get_tf_value()
+        t_lo, t_hi = self._compute_y_limits([tf_now, tf_now])
+        self.temp_ax.set_ylim(t_lo, t_hi)
+        try:
+            pf_now = float(self.pf_var.get().strip())
+        except Exception:
+            pf_now = 101.3
+        p_lo, p_hi = self._compute_y_limits([pf_now, pf_now])
+        self.press_ax.set_ylim(p_lo, p_hi)
+        self.temp_canvas.draw_idle()
+        self.press_canvas.draw_idle()
 
     def _try_connect_port(self, port: str) -> bool:
         for baud in BAUD_CANDIDATES:
@@ -266,10 +362,18 @@ class TempControllerApp:
                     self.active_baud = baud
                     self.ser.timeout = 0.2
                     base_tf = self._get_tf_value()
+                    try:
+                        base_pf = float(self.pf_var.get().strip())
+                    except Exception:
+                        base_pf = 101.3
                     self.sim_tf_current = base_tf
                     self.sim_tf_target = base_tf
                     self.sim_rate_cpm = 0.0
-                    self.sim_mode = "hold"
+                    self.sim_temp_mode = "hold"
+                    self.sim_pf_current = base_pf
+                    self.sim_pf_target = base_pf
+                    self.sim_prate_kpm = 0.0
+                    self.sim_press_mode = "hold"
                     return True
                 self.disconnect(log_it=False)
             except Exception as e:
@@ -438,8 +542,9 @@ class TempControllerApp:
         self.last_pk_value = pk
         self.root.after(0, lambda v=f"{tc:.2f}": self.tc_var.set(v))
         self.root.after(0, lambda v=f"{pk:.3f}": self.pk_var.set(v))
-        # Update chart at the same data point as the TC numeric display.
-        self._push_plot(tc, self.sim_tf_current)
+        # Update both pages at the same data point as numeric display.
+        self._push_temp_plot(tc, self.sim_tf_current)
+        self._push_press_plot(pk, self.sim_pf_current)
 
     def _get_tf_value(self) -> float:
         try:
@@ -447,18 +552,25 @@ class TempControllerApp:
         except Exception:
             return 25.0
 
-    def _push_plot(self, tc: float, tf: float) -> None:
+    def _push_temp_plot(self, tc: float, tf: float) -> None:
         t = time.time() - self.t0
-        self.time_data.append(t)
+        self.temp_time_data.append(t)
         self.tc_data.append(tc)
         self.tf_data.append(tf)
-        self.root.after(0, self._redraw_plot)
+        self.root.after(0, self._redraw_temp_plot)
 
-    def _redraw_plot(self) -> None:
-        if not self.time_data:
+    def _push_press_plot(self, pk: float, pf: float) -> None:
+        t = time.time() - self.t0
+        self.press_time_data.append(t)
+        self.pk_data.append(pk)
+        self.pf_data.append(pf)
+        self.root.after(0, self._redraw_press_plot)
+
+    def _redraw_temp_plot(self) -> None:
+        if not self.temp_time_data:
             return
 
-        xs = list(self.time_data)
+        xs = list(self.temp_time_data)
         ys_tc = list(self.tc_data)
         ys_tf = list(self.tf_data)
 
@@ -470,15 +582,49 @@ class TempControllerApp:
         self.line_tc.set_data(xs, ys_tc)
         self.line_tf.set_data(xs, ys_tf)
         # Keep timeline continuously extending; do not use rolling-window refresh.
-        self.ax.set_xlim(0, xs[-1] + 1)
+        self.temp_ax.set_xlim(0, xs[-1] + 1)
 
-        y_all = ys_tc + ys_tf
-        y_min = min(y_all) - 1
-        y_max = max(y_all) + 1
-        if abs(y_max - y_min) < 1:
-            y_max = y_min + 1
-        self.ax.set_ylim(y_min, y_max)
-        self.canvas.draw_idle()
+        y_min, y_max = self._compute_y_limits(ys_tc + ys_tf)
+        self.temp_ax.set_ylim(y_min, y_max)
+        self.temp_canvas.draw_idle()
+
+    def _redraw_press_plot(self) -> None:
+        if not self.press_time_data:
+            return
+
+        xs = list(self.press_time_data)
+        ys_pk = list(self.pk_data)
+        ys_pf = list(self.pf_data)
+
+        if len(xs) == 1:
+            xs = [xs[0] - 0.1, xs[0]]
+            ys_pk = [ys_pk[0], ys_pk[0]]
+            ys_pf = [ys_pf[0], ys_pf[0]]
+
+        self.line_pk.set_data(xs, ys_pk)
+        self.line_pf.set_data(xs, ys_pf)
+        self.press_ax.set_xlim(0, xs[-1] + 1)
+
+        y_min, y_max = self._compute_y_limits(ys_pk + ys_pf)
+        self.press_ax.set_ylim(y_min, y_max)
+        self.press_canvas.draw_idle()
+
+    @staticmethod
+    def _compute_y_limits(values: list[float]) -> tuple[float, float]:
+        if not values:
+            return 0.0, 1.0
+        raw_min = min(values)
+        raw_max = max(values)
+        span = max(raw_max - raw_min, 1.0)
+
+        # Keep more headroom on top so curves do not stick to the upper edge.
+        top_pad = max(span * 0.22, abs(raw_max) * 0.02, 1.5)
+        bottom_pad = max(span * 0.12, abs(raw_min) * 0.01, 1.0)
+        lo = raw_min - bottom_pad
+        hi = raw_max + top_pad
+        if hi <= lo:
+            hi = lo + 1.0
+        return lo, hi
 
     @staticmethod
     def _extract_temp_pressure(resp: str) -> tuple[float | None, float, float | None]:
@@ -676,11 +822,15 @@ class TempControllerApp:
         self.sim_tf_target = tf
         self.sim_tf_current = tf
         self.sim_rate_cpm = 0.0
-        self.sim_mode = "hold"
+        self.sim_temp_mode = "hold"
         self.ramp_target_temp = None
         self.reach_inband_since = None
         self.reach_confirmed = False
-        self._run_async_io(lambda: self.send_cmd(f"TEMPerature:HOLD {tf}", source="ctrl-hold"), "Hold")
+        def hold_task() -> None:
+            with self.query_lock:
+                self._send_cmd_unlocked(f"TEMPerature:OPSLave {self.control_slave}", source="ctrl-hold")
+                self._send_cmd_unlocked(f"TEMPerature:HOLD {tf}", source="ctrl-hold")
+        self._run_async_io(hold_task, "Hold")
         self.append_log(f"HOLD sent: {tf}")
 
     def send_ramp(self) -> None:
@@ -700,7 +850,7 @@ class TempControllerApp:
         self.sim_tf_target = tf
         self.sim_tf_current = self.last_tc_value
         self.sim_rate_cpm = abs(rt)
-        self.sim_mode = "ramp"
+        self.sim_temp_mode = "ramp"
         self.ramp_target_temp = tf
         self.reach_inband_since = None
         self.reach_confirmed = False
@@ -723,8 +873,79 @@ class TempControllerApp:
         self.ramp_target_temp = None
         self.reach_inband_since = None
         self.reach_confirmed = False
-        self._run_async_io(lambda: self.send_cmd("TEMPerature:STOP", source="ctrl-stop"), "Stop")
+        def stop_task() -> None:
+            with self.query_lock:
+                self._send_cmd_unlocked(f"TEMPerature:OPSLave {self.control_slave}", source="ctrl-stop")
+                self._send_cmd_unlocked("TEMPerature:STOP", source="ctrl-stop")
+        self._run_async_io(stop_task, "Stop")
         self.append_log("STOP sent")
+
+    def send_press_hold(self) -> None:
+        if not self.is_connected():
+            self.append_log("Not connected.")
+            return
+        try:
+            pf = float(self.pf_var.get().strip())
+        except ValueError:
+            self.append_log("Invalid PF.")
+            return
+        self.sim_pf_target = pf
+        self.sim_pf_current = pf
+        self.sim_prate_kpm = 0.0
+        self.sim_press_mode = "hold"
+
+        def hold_task() -> None:
+            with self.query_lock:
+                self._send_cmd_unlocked(f"TEMPerature:OPSLave {self.press_control_slave}", source="ctrl-phold")
+                self._send_cmd_unlocked(f"TEMPerature:HOLD {pf}", source="ctrl-phold")
+
+        self._run_async_io(hold_task, "Pressure Hold")
+        self.append_log(f"P-HOLD sent: {pf}")
+
+    def send_press_ramp(self) -> None:
+        if not self.is_connected():
+            self.append_log("Not connected.")
+            return
+        try:
+            pf = float(self.pf_var.get().strip())
+            pr = float(self.prate_var.get().strip())
+        except ValueError:
+            self.append_log("Invalid PF/P-Rate.")
+            return
+        if pr <= 0:
+            self.append_log("P-Rate must be > 0 kPa/min.")
+            return
+        self.sim_pf_target = pf
+        self.sim_pf_current = self.last_pk_value
+        self.sim_prate_kpm = abs(pr)
+        self.sim_press_mode = "ramp"
+
+        def ramp_task() -> None:
+            with self.query_lock:
+                self._send_cmd_unlocked(f"TEMPerature:OPSLave {self.press_control_slave}", source="ctrl-pramp")
+                self._send_cmd_unlocked(f"TEMPerature:RAMP {pf},{pr}", source="ctrl-pramp")
+                seq = self._send_cmd_unlocked("TEMPerature:RTINformation?", source="ctrl-pramp-verify")
+                st = self._read_response(max_wait_s=POLL_WAIT_S)
+                self.append_log(f"RX#{seq} [ctrl-pramp-verify] {st!r}")
+            self.append_log(f"P-RAMP verify RT => {st!r}")
+
+        self._run_async_io(ramp_task, "Pressure Ramp")
+        self.append_log(f"P-RAMP sent: pf={pf}, rate={pr}")
+
+    def send_press_stop(self) -> None:
+        if not self.is_connected():
+            self.append_log("Not connected.")
+            return
+        self.sim_press_mode = "hold"
+        self.sim_prate_kpm = 0.0
+
+        def stop_task() -> None:
+            with self.query_lock:
+                self._send_cmd_unlocked(f"TEMPerature:OPSLave {self.press_control_slave}", source="ctrl-pstop")
+                self._send_cmd_unlocked("TEMPerature:STOP", source="ctrl-pstop")
+
+        self._run_async_io(stop_task, "Pressure Stop")
+        self.append_log("P-STOP sent")
 
     def send_custom_cmd(self) -> None:
         cmd = self.cmd_var.get().strip()
