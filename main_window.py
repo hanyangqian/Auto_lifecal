@@ -41,6 +41,7 @@ CURVE_TIMEOUT_MS = 3000
 DISCOVERY_TIMEOUT_MS = 1500
 HOTPLATE_BAUD_CANDIDATES = (9600, 115200)
 HOTPLATE_QUERY_WAIT_S = 0.35
+SIGGEN_BAUD = 115200
 TARGET_TOL_C = 0.5
 TARGET_HOLD_S = 20.0
 MAX_RAMP_RECOVERIES = 2
@@ -412,6 +413,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.data_log_enabled = False
         self._log_write_err_reported = False
         self.info_fit_window = None
+        self.siggen_com_port = ""
+        self.siggen_channels = {"CH1"}
 
         self.channel_btn = QPushButton()
         self._update_channel_button_text()
@@ -563,15 +566,22 @@ class MainWindow(LaserLifetimeCalibrationUI):
     def load_port_settings(self):
         saved_scope = self.settings.value("scope_com_port", "", type=str).strip()
         saved_hotplate = self.settings.value("hotplate_com_port", "", type=str).strip()
+        saved_siggen = self.settings.value("siggen_com_port", "", type=str).strip()
+        saved_siggen_channels = self.settings.value("siggen_channels", "CH1", type=str).strip()
         if saved_scope:
             self.scope_com_port = saved_scope
         if saved_hotplate:
             self.hotplate_com_port = saved_hotplate
+        if saved_siggen:
+            self.siggen_com_port = saved_siggen
+        channels = {ch for ch in saved_siggen_channels.split(",") if ch in {"CH1", "CH2"}}
+        self.siggen_channels = channels or {"CH1"}
         self.update_settings_tooltip()
 
     def persist_port_settings(self):
         scope_port = (self.scope_com_port or "").strip()
         hotplate_port = (self.hotplate_com_port or "").strip()
+        siggen_port = (self.siggen_com_port or "").strip()
         if scope_port:
             self.settings.setValue("scope_com_port", scope_port)
         else:
@@ -580,6 +590,12 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.settings.setValue("hotplate_com_port", hotplate_port)
         else:
             self.settings.remove("hotplate_com_port")
+        if siggen_port:
+            self.settings.setValue("siggen_com_port", siggen_port)
+        else:
+            self.settings.remove("siggen_com_port")
+        channels_text = ",".join(sorted(ch for ch in self.siggen_channels if ch in {"CH1", "CH2"}))
+        self.settings.setValue("siggen_channels", channels_text or "CH1")
 
     def persist_save_path(self):
         save_dir = self.save_path_edit.text().strip()
@@ -606,8 +622,20 @@ class MainWindow(LaserLifetimeCalibrationUI):
         hotplate_combo = QComboBox()
         grid.addWidget(hotplate_combo, 1, 1)
 
+        grid.addWidget(QLabel("信号发生器 COM口:"), 2, 0)
+        siggen_combo = QComboBox()
+        grid.addWidget(siggen_combo, 2, 1)
+
+        grid.addWidget(QLabel("信号发生器输出通道:"), 3, 0)
+        siggen_ch_row = QVBoxLayout()
+        siggen_ch1 = QCheckBox("CH1")
+        siggen_ch2 = QCheckBox("CH2")
+        siggen_ch_row.addWidget(siggen_ch1)
+        siggen_ch_row.addWidget(siggen_ch2)
+        grid.addLayout(siggen_ch_row, 3, 1)
+
         status_label = QLabel("可手动选择，也可自动检测(100ms/端口询问)")
-        grid.addWidget(status_label, 2, 0, 1, 2)
+        grid.addWidget(status_label, 4, 0, 1, 2)
         layout.addLayout(grid)
 
         tools_layout = QGridLayout()
@@ -620,9 +648,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
         def fill_port_combos():
             scope_combo.clear()
             hotplate_combo.clear()
+            siggen_combo.clear()
             for label, value in self.get_available_com_ports():
                 scope_combo.addItem(label, value)
                 hotplate_combo.addItem(label, value)
+                siggen_combo.addItem(label, value)
 
             def ensure_current(combo, current_value):
                 idx = combo.findData(current_value)
@@ -634,11 +664,15 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
             ensure_current(scope_combo, self.scope_com_port)
             ensure_current(hotplate_combo, self.hotplate_com_port)
+            ensure_current(siggen_combo, self.siggen_com_port)
+            siggen_ch1.setChecked("CH1" in self.siggen_channels)
+            siggen_ch2.setChecked("CH2" in self.siggen_channels)
 
         def on_detect_done(result):
             auto_btn.setEnabled(True)
             scope_val = result.get("scope_com")
             hotplate_val = result.get("hotplate_com")
+            siggen_val = result.get("siggen_com")
             if scope_val:
                 idx = scope_combo.findData(scope_val)
                 if idx < 0:
@@ -651,6 +685,12 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     hotplate_combo.addItem(f"{hotplate_val} (自动检测)", hotplate_val)
                     idx = hotplate_combo.count() - 1
                 hotplate_combo.setCurrentIndex(idx)
+            if siggen_val:
+                idx = siggen_combo.findData(siggen_val)
+                if idx < 0:
+                    siggen_combo.addItem(f"{siggen_val} (自动检测)", siggen_val)
+                    idx = siggen_combo.count() - 1
+                siggen_combo.setCurrentIndex(idx)
             status_label.setText(result.get("message", "自动检测完成"))
 
         def start_auto_detect():
@@ -683,9 +723,17 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         self.scope_com_port = scope_combo.currentData() or self.scope_com_port
         self.hotplate_com_port = hotplate_combo.currentData() or self.hotplate_com_port
+        self.siggen_com_port = siggen_combo.currentData() or self.siggen_com_port
+        channels = set()
+        if siggen_ch1.isChecked():
+            channels.add("CH1")
+        if siggen_ch2.isChecked():
+            channels.add("CH2")
+        self.siggen_channels = channels
         self.persist_port_settings()
         self.update_settings_tooltip()
         hot_ok, hot_sn = self.get_hotplate_identity_status()
+        sig_ok, sig_sn = self.get_siggen_identity_status()
         self.start_hotplate_live_poll()
         scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
         self.append_status(
@@ -694,12 +742,16 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.append_status(
             f"[初始化] 示波器: 端口={self.scope_com_port}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
         )
+        self.append_status(
+            f"[初始化] 信号发生器: 端口={self.siggen_com_port or '未配置'}, 状态={sig_sn}, 连接={'是' if sig_ok else '否'}, 通道={','.join(sorted(self.siggen_channels)) or '无'}"
+        )
 
     def _auto_initialize_for_start(self):
         self.persist_port_settings()
         self.update_settings_tooltip()
 
         hot_ok, hot_sn = self.get_hotplate_identity_status()
+        sig_ok, sig_sn = self.get_siggen_identity_status()
         if hot_ok:
             self.start_hotplate_live_poll()
         scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
@@ -710,7 +762,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.append_status(
             f"[自动初始化] 示波器: 端口={self.scope_com_port}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
         )
-        return scope_ok, hot_ok
+        self.append_status(
+            f"[自动初始化] 信号发生器: 端口={self.siggen_com_port or '未配置'}, 状态={sig_sn}, 连接={'是' if sig_ok else '否'}, 通道={','.join(sorted(self.siggen_channels)) or '无'}"
+        )
+        return scope_ok, hot_ok, sig_ok
 
     def _probe_port_once(self, port, baud, cmd):
         ser = None
@@ -747,14 +802,15 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def _scan_serial_devices(self):
         if serial is None:
-            return {"scope_com": None, "hotplate_com": None, "message": "未安装pyserial"}
+            return {"scope_com": None, "hotplate_com": None, "siggen_com": None, "message": "未安装pyserial"}
         try:
             ports = [p.device for p in list_ports.comports()] if list_ports else []
         except Exception as ex:
-            return {"scope_com": None, "hotplate_com": None, "message": f"串口枚举失败: {ex}"}
+            return {"scope_com": None, "hotplate_com": None, "siggen_com": None, "message": f"串口枚举失败: {ex}"}
 
         scope_com = None
         hotplate_com = None
+        siggen_com = None
         for port in ports:
             for baud in HOTPLATE_BAUD_CANDIDATES:
                 idn = self._probe_port_once(port, baud, "*IDN?")
@@ -767,13 +823,136 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     rt = self._probe_port_once(port, baud, "TEMPerature:RTINformation?")
                     if "MK:" in rt.upper():
                         hotplate_com = port
-                if scope_com and hotplate_com:
+                if siggen_com is None:
+                    rmn = self._probe_port_once(port, SIGGEN_BAUD, "RMN")
+                    rfn = self._probe_port_once(port, SIGGEN_BAUD, "RFN")
+                    if re.fullmatch(r"\d+", (rmn or "").strip()) and re.fullmatch(r"\d+", (rfn or "").strip()):
+                        siggen_com = port
+                if scope_com and hotplate_com and siggen_com:
                     break
-            if scope_com and hotplate_com:
+            if scope_com and hotplate_com and siggen_com:
                 break
 
-        msg = f"自动检测完成: 示波器={scope_com or '未找到'}, 标定台={hotplate_com or '未找到'}"
-        return {"scope_com": scope_com, "hotplate_com": hotplate_com, "message": msg}
+        msg = (
+            f"自动检测完成: 示波器={scope_com or '未找到'}, 标定台={hotplate_com or '未找到'}, "
+            f"信号发生器={siggen_com or '未找到'}"
+        )
+        return {"scope_com": scope_com, "hotplate_com": hotplate_com, "siggen_com": siggen_com, "message": msg}
+
+    def _query_siggen(self, command: str):
+        if serial is None:
+            raise RuntimeError("未安装 pyserial，请先执行: pip install pyserial")
+        port = (self.siggen_com_port or "").strip()
+        if not port:
+            raise RuntimeError("未配置信号发生器 COM 口，请先在初始化设置中配置")
+        ser = None
+        try:
+            ser = serial.Serial(
+                port,
+                baudrate=SIGGEN_BAUD,
+                timeout=0.3,
+                write_timeout=0.4,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+            )
+            time.sleep(0.05)
+            ser.reset_input_buffer()
+            ser.write((command + "\n").encode("ascii"))
+            ser.flush()
+            return ser.readline().decode("ascii", errors="ignore").strip("\x00\r\n ")
+        finally:
+            try:
+                if ser and ser.is_open:
+                    ser.close()
+            except Exception:
+                pass
+
+    def _send_siggen_commands(self, commands):
+        if serial is None:
+            raise RuntimeError("未安装 pyserial，请先执行: pip install pyserial")
+        port = (self.siggen_com_port or "").strip()
+        if not port:
+            raise RuntimeError("未配置信号发生器 COM 口，请先在初始化设置中配置")
+        ser = None
+        try:
+            ser = serial.Serial(
+                port,
+                baudrate=SIGGEN_BAUD,
+                timeout=0.3,
+                write_timeout=0.4,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+            )
+            time.sleep(0.05)
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            for cmd in commands:
+                ser.write((cmd + "\n").encode("ascii"))
+                ser.flush()
+                time.sleep(0.05)
+        finally:
+            try:
+                if ser and ser.is_open:
+                    ser.close()
+            except Exception:
+                pass
+
+    def _set_siggen_output(self, enable: bool):
+        channels = [ch for ch in sorted(self.siggen_channels) if ch in {"CH1", "CH2"}]
+        if not channels:
+            return
+        cmds = []
+        for ch in channels:
+            if ch == "CH1":
+                cmds.append("WMN1" if enable else "WMN0")
+            elif ch == "CH2":
+                cmds.append("WFN1" if enable else "WFN0")
+        if not cmds:
+            return
+        self._send_siggen_commands(cmds)
+        state = "ON" if enable else "OFF"
+        self.append_status(f"[信号发生器] 通道 {','.join(channels)} 输出 -> {state}")
+
+    def get_siggen_identity_status(self):
+        if not (self.siggen_com_port or "").strip():
+            return False, "未配置"
+        try:
+            rmn = self._query_siggen("RMN")
+            rfn = self._query_siggen("RFN")
+            if re.fullmatch(r"\d+", (rmn or "").strip()) and re.fullmatch(r"\d+", (rfn or "").strip()):
+                return True, f"CH1={rmn}, CH2={rfn}"
+            return False, "无响应"
+        except Exception as ex:
+            return False, f"失败: {str(ex)[:32]}"
+
+    def wait_light_source_stable(self):
+        wait_s = int(self.stable_time_spin.value())
+        if wait_s <= 0:
+            return
+
+        siggen_enabled = bool(self.siggen_com_port.strip() and self.siggen_channels)
+        if siggen_enabled:
+            self._set_siggen_output(True)
+        else:
+            self.append_status("[光源] 未配置信号发生器或未选择输出通道，仅执行稳定等待")
+
+        self.append_status(f"[光源] 稳定等待启动: {wait_s}s")
+        start = time.time()
+        last_log_sec = -1
+        while True:
+            if self.stop_requested.is_set():
+                raise TaskStoppedError("用户已停止任务")
+            elapsed = int(time.time() - start)
+            if elapsed != last_log_sec:
+                last_log_sec = elapsed
+                self.append_data(f"光源稳定进度={min(elapsed, wait_s)}/{wait_s}s")
+            if elapsed >= wait_s:
+                break
+            QApplication.processEvents()
+            time.sleep(0.2)
+        self.append_status("[光源] 稳定等待完成，开始示波器保存")
 
     def start_hotplate_live_poll(self):
         if serial is None:
@@ -1233,6 +1412,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.stop_requested.set()
         self.append_status("[任务] 已请求停止，正在安全结束当前步骤...")
         self._stop_hotplate_and_live_plot("手动停止")
+        try:
+            self._set_siggen_output(False)
+        except Exception:
+            pass
 
     def _stop_hotplate_and_live_plot(self, reason: str = "流程结束"):
         try:
@@ -1269,7 +1452,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.start_btn.setChecked(False)
             return
 
-        scope_ok, hot_ok = self._auto_initialize_for_start()
+        scope_ok, hot_ok, _ = self._auto_initialize_for_start()
         if not scope_ok:
             QMessageBox.warning(self, "提示", "示波器未连接，无法开始")
             self.start_btn.setChecked(False)
@@ -1313,10 +1496,15 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
                 self._apply_stage_setpoints(stage["temp"], stage["press"])
                 self.wait_for_temp_press_stable()
+                self.wait_light_source_stable()
                 stage_files, start_idx = self._run_scope_cycles_for_stage(
                     scope, save_dir, start_idx, cycles, i, stage_total
                 )
                 saved_files.extend(stage_files)
+                try:
+                    self._set_siggen_output(False)
+                except Exception as ex:
+                    self.append_status(f"[信号发生器] 关闭输出失败: {ex}")
 
             self._stop_hotplate_and_live_plot("流程完成")
 
@@ -1346,6 +1534,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"{e}\n\n{traceback.format_exc()}")
         finally:
+            try:
+                self._set_siggen_output(False)
+            except Exception:
+                pass
             self.start_btn.setChecked(False)
             self.data_log_enabled = False
             self.sensor_log_file_path = None
