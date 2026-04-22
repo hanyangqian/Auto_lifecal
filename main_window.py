@@ -41,10 +41,10 @@ CURVE_TIMEOUT_MS = 3000
 DISCOVERY_TIMEOUT_MS = 1500
 HOTPLATE_BAUD_CANDIDATES = (9600, 115200)
 HOTPLATE_QUERY_WAIT_S = 0.35
+PLOT_TICK_S = 0.2
 SIGGEN_BAUD = 115200
 TARGET_TOL_C = 0.5
 TARGET_HOLD_S = 20.0
-MAX_RAMP_RECOVERIES = 2
 SERIAL_PROBE_TIMEOUT_S = 0.1
 PRESS_CONTROL_SLAVE = 2
 FNAME_RE = re.compile(r"^T(\\d{4})(CH[1-4](?:CH[1-4])*)?\\.CSV$", re.IGNORECASE)
@@ -391,16 +391,27 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.reach_inband_since = None
         self.reach_confirmed = False
         self.last_hotplate_s_status = None
-        self.ramp_recovery_count = 0
         self.hotplate_guard_timer = QTimer(self)
         self.hotplate_guard_timer.setInterval(1200)
         self.hotplate_guard_timer.timeout.connect(self.check_hotplate_ramp_guard)
         self.hotplate_live_timer = QTimer(self)
         self.hotplate_live_timer.setInterval(1000)
         self.hotplate_live_timer.timeout.connect(self.poll_hotplate_live_data)
+        self.hotplate_plot_timer = QTimer(self)
+        self.hotplate_plot_timer.setInterval(int(PLOT_TICK_S * 1000))
+        self.hotplate_plot_timer.timeout.connect(self._tick_hotplate_plot)
         self.hotplate_live_err_suppressed = False
         self.last_live_tc = None
         self.last_live_pk = None
+        self.sim_tf_current = float(self.hotplate_tf_spin.value())
+        self.sim_tf_target = self.sim_tf_current
+        self.sim_rate_cpm = 0.0
+        self.sim_temp_mode = "hold"  # "hold" | "ramp"
+        self.sim_pf_current = float(self.hotplate_pf_spin.value())
+        self.sim_pf_target = self.sim_pf_current
+        self.sim_prate_kpm = 0.0
+        self.sim_press_mode = "hold"  # "hold" | "ramp"
+        self.last_sim_ts = time.time()
         self.live_temp_since = None
         self.live_press_since = None
         self.live_temp_stable = False
@@ -961,6 +972,41 @@ class MainWindow(LaserLifetimeCalibrationUI):
             return
         if not self.hotplate_live_timer.isActive():
             self.hotplate_live_timer.start()
+        if not self.hotplate_plot_timer.isActive():
+            self.last_sim_ts = time.time()
+            self.hotplate_plot_timer.start()
+
+    def _tick_hotplate_plot(self):
+        now = time.time()
+        dt = max(0.0, now - self.last_sim_ts)
+        self.last_sim_ts = now
+
+        if self.sim_temp_mode == "ramp":
+            step = (self.sim_rate_cpm / 60.0) * dt
+            if self.sim_tf_current < self.sim_tf_target:
+                self.sim_tf_current = min(self.sim_tf_current + step, self.sim_tf_target)
+            else:
+                self.sim_tf_current = max(self.sim_tf_current - step, self.sim_tf_target)
+            if abs(self.sim_tf_current - self.sim_tf_target) < 1e-6:
+                self.sim_temp_mode = "hold"
+
+        if self.sim_press_mode == "ramp":
+            pstep = (self.sim_prate_kpm / 60.0) * dt
+            if self.sim_pf_current < self.sim_pf_target:
+                self.sim_pf_current = min(self.sim_pf_current + pstep, self.sim_pf_target)
+            else:
+                self.sim_pf_current = max(self.sim_pf_current - pstep, self.sim_pf_target)
+            if abs(self.sim_pf_current - self.sim_pf_target) < 1e-6:
+                self.sim_press_mode = "hold"
+
+        if self.last_live_tc is None or self.last_live_pk is None:
+            return
+        self.push_hotplate_plot(
+            self.last_live_tc,
+            self.last_live_pk,
+            self.sim_tf_current,
+            self.sim_pf_current,
+        )
  
     def get_hotplate_identity_status(self):
         if not (self.hotplate_com_port or "").strip():
@@ -998,11 +1044,12 @@ class MainWindow(LaserLifetimeCalibrationUI):
             if tc is None and pk is None:
                 return
 
-            if tc is not None and pk is not None:
-                try:
-                    self.push_hotplate_plot(tc, pk, float(self.hotplate_tf_spin.value()), float(self.hotplate_pf_spin.value()))
-                except Exception:
-                    pass
+            if tc is not None and self.last_live_tc is None and self.sim_temp_mode == "hold":
+                self.sim_tf_current = tc
+                self.sim_tf_target = tc
+            if pk is not None and self.last_live_pk is None and self.sim_press_mode == "hold":
+                self.sim_pf_current = pk
+                self.sim_pf_target = pk
 
             # Avoid writing exactly duplicated lines each second when values stay unchanged.
             if (
@@ -1328,7 +1375,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self.reach_inband_since = None
                 self.reach_confirmed = False
                 self.last_hotplate_s_status = None
-                self.ramp_recovery_count = 0
+                base_tc = self.last_live_tc if self.last_live_tc is not None else self.sim_tf_current
+                self.sim_tf_target = temp_target
+                self.sim_tf_current = base_tc
+                self.sim_rate_cpm = abs(rate)
+                self.sim_temp_mode = "ramp"
                 self.hotplate_guard_timer.start()
                 self.append_status(f"[阶段] 温度设定: RAMP -> {temp_target:.2f} ℃ @ {rate:.2f} ℃/min")
             else:
@@ -1338,6 +1389,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         f"TEMPerature:HOLD {temp_target}",
                     ]
                 )
+                self.sim_tf_target = temp_target
+                self.sim_tf_current = temp_target
+                self.sim_rate_cpm = 0.0
+                self.sim_temp_mode = "hold"
                 self._reset_ramp_guard_state()
                 self.append_status(f"[阶段] 温度设定: HOLD -> {temp_target:.2f} ℃")
 
@@ -1354,6 +1409,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         f"TEMPerature:RAMP {press_target},{rate}",
                     ]
                 )
+                base_pk = self.last_live_pk if self.last_live_pk is not None else self.sim_pf_current
+                self.sim_pf_target = press_target
+                self.sim_pf_current = base_pk
+                self.sim_prate_kpm = abs(rate)
+                self.sim_press_mode = "ramp"
                 self.append_status(f"[阶段] 压力设定: RAMP -> {press_target:.2f} kPa @ {rate:.2f} kPa/min")
             else:
                 self._send_hotplate_commands(
@@ -1362,6 +1422,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         f"TEMPerature:HOLD {press_target}",
                     ]
                 )
+                self.sim_pf_target = press_target
+                self.sim_pf_current = press_target
+                self.sim_prate_kpm = 0.0
+                self.sim_press_mode = "hold"
                 self.append_status(f"[阶段] 压力设定: HOLD -> {press_target:.2f} kPa")
 
     def _run_scope_cycles_for_stage(self, scope, save_dir: str, start_idx: int, cycles: int, stage_idx: int, stage_total: int):
@@ -1433,6 +1497,14 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if self.hotplate_live_timer.isActive():
             self.hotplate_live_timer.stop()
             self.append_status("[标定台] 实时曲线已停止刷新")
+        if self.hotplate_plot_timer.isActive():
+            self.hotplate_plot_timer.stop()
+        self.sim_temp_mode = "hold"
+        self.sim_rate_cpm = 0.0
+        self.sim_tf_target = self.sim_tf_current
+        self.sim_press_mode = "hold"
+        self.sim_prate_kpm = 0.0
+        self.sim_pf_target = self.sim_pf_current
 
     def do_save(self):
         if not self.start_btn.isChecked():
@@ -1792,10 +1864,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.reach_inband_since = None
         self.reach_confirmed = False
         self.last_hotplate_s_status = None
-        self.ramp_recovery_count = 0
         self.hotplate_guard_timer.stop()
 
-    def _update_reach_judge(self, tc_now, s_status):
+    def _update_reach_judge(self, tc_now, s_status, tf_rt=None, tt_rt=None, err_code=None):
         if self.ramp_target_temp is None or tc_now is None:
             return
 
@@ -1812,11 +1883,40 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self.reach_inband_since = None
                 inband_sec = 0.0
 
+            self.append_status(
+                f"[标定台] RAMP-JUDGE tc={tc_now:.3f}, target={target:.3f}, diff={diff:.3f}, "
+                f"inband={inband_sec:.1f}/{TARGET_HOLD_S:.0f}s, tf={tf_rt}, tt={tt_rt}, err={err_code}"
+            )
+
             if (not self.reach_confirmed) and inband_sec >= TARGET_HOLD_S:
                 self.reach_confirmed = True
                 self.append_status(
                     f"[标定台] RAMP达标: |TC-TF| <= {TARGET_TOL_C:.1f}℃ 持续 {TARGET_HOLD_S:.0f}s"
                 )
+        elif s_status == 0 and not self.reach_confirmed:
+            inband_sec = 0.0 if self.reach_inband_since is None else (now - self.reach_inband_since)
+            self.append_status(
+                f"[标定台] WARN ramp stopped before reach-confirmed: tc={tc_now:.3f}, target={target:.3f}, "
+                f"diff={diff:.3f}, inband={inband_sec:.1f}/{TARGET_HOLD_S:.0f}s, tf={tf_rt}, tt={tt_rt}, err={err_code}"
+            )
+
+    def _diagnose_hotplate_unexpected_stop(self):
+        commands = [
+            "TEMPerature:STATus?",
+            "TEMPerature:ERRor?",
+            "TEMPerature:CHSWitch?",
+            "TEMPerature:RANGe?",
+            "TEMPerature:OPSLave?",
+            "TEMPerature:RTINformation?",
+        ]
+        fields = []
+        for cmd in commands:
+            try:
+                resp, baud = self._query_hotplate(cmd)
+                fields.append(f"{cmd}@{baud}bps={resp!r}")
+            except Exception as ex:
+                fields.append(f"{cmd}=<ERR:{ex}>")
+        self.append_status("[标定台] DIAG stop snapshot: " + "; ".join(fields))
 
     def check_hotplate_ramp_guard(self):
         if self.ramp_target_temp is None:
@@ -1824,30 +1924,24 @@ class MainWindow(LaserLifetimeCalibrationUI):
             return
         try:
             rt_resp, baud = self._query_hotplate("TEMPerature:RTINformation?")
-            tc, _, _, _, s_status, err_code = self._extract_rt_channels(rt_resp, self.control_slave)
-            self._update_reach_judge(tc, s_status)
+            tc, _, tf_rt, tt_rt, s_status, err_code = self._extract_rt_channels(rt_resp, self.control_slave)
+            self._update_reach_judge(tc, s_status, tf_rt=tf_rt, tt_rt=tt_rt, err_code=err_code)
+
+            if s_status != self.last_hotplate_s_status:
+                self.append_status(
+                    f"[标定台] STATE s_status changed: {self.last_hotplate_s_status} -> {s_status} "
+                    "(0-stop,1-hold,2-ramp)"
+                )
 
             if (
                 self.last_hotplate_s_status == 2
                 and s_status == 0
                 and not self.reach_confirmed
             ):
-                if self.ramp_recovery_count < MAX_RAMP_RECOVERIES and self.ramp_rate_cpm is not None:
-                    self.ramp_recovery_count += 1
-                    self._send_hotplate_commands(
-                        [
-                            f"TEMPerature:OPSLave {self.control_slave}",
-                            f"TEMPerature:RAMP {self.ramp_target_temp},{self.ramp_rate_cpm}",
-                        ]
-                    )
-                    self.append_status(
-                        f"[标定台] 检测到RAMP中断(未达标), 自动重发RAMP "
-                        f"({self.ramp_recovery_count}/{MAX_RAMP_RECOVERIES}) [{baud}bps]"
-                    )
-                else:
-                    self.append_status(
-                        f"[标定台] 警告: RAMP中断且自动恢复已达上限, err={err_code}"
-                    )
+                self.append_status(
+                    f"[标定台] 警告: RAMP在未达标时提前停止 [{baud}bps], rt={rt_resp!r}"
+                )
+                self._diagnose_hotplate_unexpected_stop()
             self.last_hotplate_s_status = s_status
 
             if self.reach_confirmed and s_status in (0, 1):
@@ -1866,6 +1960,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     f"TEMPerature:HOLD {tf}",
                 ]
             )
+            self.sim_tf_target = tf
+            self.sim_tf_current = tf
+            self.sim_rate_cpm = 0.0
+            self.sim_temp_mode = "hold"
             self._reset_ramp_guard_state()
             self.append_status(f"[标定台] HOLD 已发送: TF={tf:.2f} ℃")
         except Exception as ex:
@@ -1889,7 +1987,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.reach_inband_since = None
             self.reach_confirmed = False
             self.last_hotplate_s_status = None
-            self.ramp_recovery_count = 0
+            base_tc = self.last_live_tc if self.last_live_tc is not None else self.sim_tf_current
+            self.sim_tf_target = tf
+            self.sim_tf_current = base_tc
+            self.sim_rate_cpm = abs(rate)
+            self.sim_temp_mode = "ramp"
             self.hotplate_guard_timer.start()
             self.append_status(
                 f"[标定台] RAMP 已发送: TF={tf:.2f} ℃, Rate={rate:.2f} ℃/min"
@@ -1905,6 +2007,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     "TEMPerature:STOP",
                 ]
             )
+            self.sim_temp_mode = "hold"
+            self.sim_rate_cpm = 0.0
+            self.sim_tf_target = self.sim_tf_current
             self._reset_ramp_guard_state()
             self.append_status("[标定台] STOP 已发送")
         except Exception as ex:
@@ -1919,6 +2024,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     f"TEMPerature:HOLD {pf}",
                 ]
             )
+            self.sim_pf_target = pf
+            self.sim_pf_current = pf
+            self.sim_prate_kpm = 0.0
+            self.sim_press_mode = "hold"
             self.append_status(f"[标定台] P-HOLD 已发送: PF={pf:.2f} kPa")
         except Exception as ex:
             QMessageBox.critical(self, "压力控制失败", str(ex))
@@ -1936,6 +2045,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     f"TEMPerature:RAMP {pf},{prate}",
                 ]
             )
+            base_pk = self.last_live_pk if self.last_live_pk is not None else self.sim_pf_current
+            self.sim_pf_target = pf
+            self.sim_pf_current = base_pk
+            self.sim_prate_kpm = abs(prate)
+            self.sim_press_mode = "ramp"
             self.append_status(f"[标定台] P-RAMP 已发送: PF={pf:.2f} kPa, P-Rate={prate:.2f} kPa/min")
         except Exception as ex:
             QMessageBox.critical(self, "压力控制失败", str(ex))
@@ -1948,6 +2062,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     "TEMPerature:STOP",
                 ]
             )
+            self.sim_press_mode = "hold"
+            self.sim_prate_kpm = 0.0
+            self.sim_pf_target = self.sim_pf_current
             self.append_status("[标定台] P-STOP 已发送")
         except Exception as ex:
             QMessageBox.critical(self, "压力控制失败", str(ex))
