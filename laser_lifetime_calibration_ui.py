@@ -386,7 +386,7 @@ class LaserLifetimeCalibrationUI(QWidget):
         self.temp_fluc_spin = QDoubleSpinBox(); self.temp_fluc_spin.setRange(0, 50); self.temp_fluc_spin.setDecimals(2); self.temp_fluc_spin.setValue(0.20)
         temp_grid.addWidget(self.temp_fluc_spin, 2, 1)
         temp_grid.addWidget(QLabel("温稳时间 (s):"), 2, 2)
-        self.temp_stable_time_spin = QSpinBox(); self.temp_stable_time_spin.setRange(0, 3600); self.temp_stable_time_spin.setValue(30)
+        self.temp_stable_time_spin = QSpinBox(); self.temp_stable_time_spin.setRange(0, 3600); self.temp_stable_time_spin.setValue(300)
         temp_grid.addWidget(self.temp_stable_time_spin, 2, 3)
 
         temp_grid.addWidget(QLabel("控制模式:"), 3, 0)
@@ -436,7 +436,7 @@ class LaserLifetimeCalibrationUI(QWidget):
         self.press_fluc_spin = QDoubleSpinBox(); self.press_fluc_spin.setRange(0, 100); self.press_fluc_spin.setDecimals(2); self.press_fluc_spin.setValue(0.50)
         press_grid.addWidget(self.press_fluc_spin, 2, 1)
         press_grid.addWidget(QLabel("压稳时间 (s):"), 2, 2)
-        self.press_stable_time_spin = QSpinBox(); self.press_stable_time_spin.setRange(0, 3600); self.press_stable_time_spin.setValue(5)
+        self.press_stable_time_spin = QSpinBox(); self.press_stable_time_spin.setRange(0, 3600); self.press_stable_time_spin.setValue(300)
         press_grid.addWidget(self.press_stable_time_spin, 2, 3)
 
         press_grid.addWidget(QLabel("控制模式:"), 3, 0)

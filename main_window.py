@@ -1583,22 +1583,21 @@ class MainWindow(LaserLifetimeCalibrationUI):
             summary = "\n".join(saved_files[:6])
             if len(saved_files) > 6:
                 summary += f"\n... 共 {len(saved_files)} 个文件"
-            QMessageBox.information(
-                self,
-                "保存完成",
-                f"已完成 {stage_total} 个阶段，每阶段 {cycles} 次采集\n{summary}",
-            )
+            completion_msg = f"已完成 {stage_total} 个阶段，每阶段 {cycles} 次采集\n{summary}"
             if self.fit_enable_btn.isChecked():
+                self.append_status(f"[任务] {completion_msg}")
                 self.append_status("[后处理] 自动启动寿命拟合全部文件结果保存")
                 fit_win, csv_files = self._prepare_info_fit_context(save_dir)
                 fit_win.show()
                 fit_win.raise_()
                 fit_win.activateWindow()
                 if csv_files:
-                    fit_win.auto_run_save_all()
+                    # 延迟到窗口事件完成后再触发，避免被当前流程结束时序阻塞。
+                    QTimer.singleShot(100, fit_win.auto_run_save_all)
                 else:
                     self.append_status("[后处理] 未找到CSV文件，已跳过寿命拟合保存")
             else:
+                QMessageBox.information(self, "保存完成", completion_msg)
                 self.append_status("[后处理] 已关闭自动寿命拟合，跳过全部文件结果保存")
 
         except TaskStoppedError:
@@ -1837,11 +1836,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 fields = []
                 if need_temp:
                     temp_prog = 0.0 if temp_since is None else max(0.0, now - temp_since)
-                    fields.append(f"温度={tc if tc is not None else 'NA'} °C")
                     fields.append(f"温稳进度={temp_prog:.1f}/{temp_hold_s}s")
                 if need_press:
                     press_prog = 0.0 if press_since is None else max(0.0, now - press_since)
-                    fields.append(f"压力={pk if pk is not None else 'NA'} kPa")
                     fields.append(f"压稳进度={press_prog:.1f}/{press_hold_s}s")
                 self.append_data(", ".join(fields))
                 last_log_ts = now
