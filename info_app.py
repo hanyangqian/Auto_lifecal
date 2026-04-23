@@ -876,9 +876,6 @@ class MATLABCurveFitter:
 
 def run_fit_task(task, cancel_check=None):
     """在后台线程执行拟合计算（不访问UI对象）。"""
-    fitter = MATLABCurveFitter()
-    fitter.cancel_requested = cancel_check
-
     robust_mapping = {
         'Off': RobustMethod.OFF,
         'LAR': RobustMethod.LAR,
@@ -893,44 +890,95 @@ def run_fit_task(task, cancel_check=None):
     algorithm_method = algorithm_mapping.get(task.get('algorithm_text'), Algorithm.LEVENBERG_MARQUARDT)
 
     fit_options = task.get('fit_options', {})
-    fitter.set_options(
-        Robust=robust_method,
-        Algorithm=algorithm_method,
-        **fit_options
-    )
 
     start = task.get('start', [])
     lower = task.get('lower', [])
     upper = task.get('upper', [])
-
-    if any(v is not None for v in start):
-        fitter.options.StartPoint = start
-
+    base_lower = None
+    base_upper = None
     if any(v is not None for v in lower):
-        fitter.options.Lower = np.array(
-            [-np.inf if v is None else v for v in lower],
-            dtype=float
-        )
-
+        base_lower = np.array([-np.inf if v is None else v for v in lower], dtype=float)
     if any(v is not None for v in upper):
-        fitter.options.Upper = np.array(
-            [np.inf if v is None else v for v in upper],
-            dtype=float
-        )
+        base_upper = np.array([np.inf if v is None else v for v in upper], dtype=float)
 
-    result = fitter.fit_curve(
-        task['x_for_fitting'],
-        task['y_for_fitting'],
-        task['model']
-    )
+    def _fit_once(x_fit, y_fit, start_point=None):
+        fitter = MATLABCurveFitter()
+        fitter.cancel_requested = cancel_check
+        fitter.set_options(Robust=robust_method, Algorithm=algorithm_method, **fit_options)
+
+        if start_point is None:
+            if any(v is not None for v in start):
+                fitter.options.StartPoint = start
+        else:
+            fitter.options.StartPoint = list(start_point)
+
+        if base_lower is not None:
+            fitter.options.Lower = np.array(base_lower, dtype=float)
+        if base_upper is not None:
+            fitter.options.Upper = np.array(base_upper, dtype=float)
+
+        return fitter.fit_curve(x_fit, y_fit, task['model'])
+
+    def _extract_characteristic_tau(model, params):
+        try:
+            if params is None:
+                return None
+            p = np.asarray(params, dtype=float)
+            if model == '单指数' and len(p) >= 2:
+                tau = float(p[1])
+                return tau if np.isfinite(tau) and tau > 0 else None
+            if model == '双指数' and len(p) >= 4:
+                a1, t1, a2, t2 = float(p[0]), float(p[1]), float(p[2]), float(p[3])
+                t_candidates = [t for t in [t1, t2] if np.isfinite(t) and t > 0]
+                if not t_candidates:
+                    return None
+                w1 = abs(a1) if np.isfinite(a1) else 0.0
+                w2 = abs(a2) if np.isfinite(a2) else 0.0
+                w_sum = w1 + w2
+                if w_sum > 0:
+                    tau_eff = (w1 * t1 + w2 * t2) / w_sum
+                    if np.isfinite(tau_eff) and tau_eff > 0:
+                        return float(tau_eff)
+                return float(max(t_candidates))
+        except Exception:
+            return None
+        return None
+
+    x_fit_all = np.asarray(task['x_for_fitting'])
+    y_fit_all = np.asarray(task['y_for_fitting'])
+    result = _fit_once(x_fit_all, y_fit_all, start_point=None)
+    x_fit_used = x_fit_all
+    y_fit_used = y_fit_all
+
+    enable_second_fit = bool(task.get('enable_second_fit', False))
+    tau_multiplier = float(task.get('second_fit_tau_multiplier', 5.0) or 5.0)
+    if not np.isfinite(tau_multiplier) or tau_multiplier <= 0:
+        tau_multiplier = 5.0
+
+    if enable_second_fit and result.success:
+        tau_ref = _extract_characteristic_tau(task['model'], result.params)
+        if tau_ref is not None and tau_ref > 0:
+            x_anchor = float(np.nanmin(x_fit_all))
+            x_limit = x_anchor + tau_multiplier * tau_ref
+            fit_mask = np.isfinite(x_fit_all) & np.isfinite(y_fit_all) & (x_fit_all >= x_anchor) & (x_fit_all <= x_limit)
+            min_points = max(3, len(result.params) + 1 if result.params is not None else 3)
+            if np.count_nonzero(fit_mask) >= min_points:
+                x_second = x_fit_all[fit_mask]
+                y_second = y_fit_all[fit_mask]
+                second_result = _fit_once(x_second, y_second, start_point=result.params)
+                if second_result.success:
+                    result = second_result
+                    x_fit_used = x_second
+                    y_fit_used = y_second
 
     return {
         'result': result,
         'model': task['model'],
         'x_for_display': task['x_for_display'],
         'y_for_display': task['y_for_display'],
-        'x_for_fitting': task['x_for_fitting'],
-        'y_for_fitting': task['y_for_fitting']
+        'x_for_fitting': x_fit_used,
+        'y_for_fitting': y_fit_used,
+        'x_for_curve': x_fit_used if enable_second_fit else task['x_for_display']
     }
 
 class FitWorker(QObject):
@@ -1304,6 +1352,7 @@ class mainWindow(QMainWindow, main_window):
         self.lineEdit_8.setEnabled(False)
         self.lineEdit_3.setEnabled(True)
         self.lineEdit_4.setEnabled(False)
+        self._setup_secondary_fit_controls()
         
         # 初始化treeWidget
         self.treeWidget.setHeaderLabels(["文件列表"])
@@ -1319,6 +1368,54 @@ class mainWindow(QMainWindow, main_window):
         
         # 初始化matplotlib图形
         self._setup_matplotlib_canvases()
+
+    def _setup_secondary_fit_controls(self):
+        """在“数据筛选”区域添加二次拟合控件。"""
+        self.checkBox_second_fit = QtWidgets.QCheckBox(self.page_2)
+        self.checkBox_second_fit.setObjectName("checkBox_second_fit")
+        self.checkBox_second_fit.setText("二次拟合")
+
+        self.label_second_fit_tau = QtWidgets.QLabel(self.page_2)
+        self.label_second_fit_tau.setObjectName("label_second_fit_tau")
+        self.label_second_fit_tau.setText("二次时间 n")
+
+        self.lineEdit_second_fit_tau = QtWidgets.QLineEdit(self.page_2)
+        self.lineEdit_second_fit_tau.setObjectName("lineEdit_second_fit_tau")
+        self.lineEdit_second_fit_tau.setText("5")
+        self.lineEdit_second_fit_tau.setMaximumWidth(80)
+
+        self.label_second_fit_tau_unit = QtWidgets.QLabel(self.page_2)
+        self.label_second_fit_tau_unit.setObjectName("label_second_fit_tau_unit")
+        self.label_second_fit_tau_unit.setText("τ")
+
+        second_fit_layout = QtWidgets.QHBoxLayout()
+        second_fit_layout.setContentsMargins(0, 0, 0, 0)
+        second_fit_layout.addWidget(self.checkBox_second_fit)
+        second_fit_layout.addWidget(self.label_second_fit_tau)
+        second_fit_layout.addWidget(self.lineEdit_second_fit_tau)
+        second_fit_layout.addWidget(self.label_second_fit_tau_unit)
+        second_fit_layout.addStretch(1)
+        self.gridLayout_3.addLayout(second_fit_layout, 6, 0, 1, 3)
+
+        self.checkBox_second_fit.toggled.connect(self._on_secondary_fit_toggled)
+        self._on_secondary_fit_toggled(False)
+
+    def _on_secondary_fit_toggled(self, checked):
+        enabled = bool(checked)
+        self.label_second_fit_tau.setEnabled(enabled)
+        self.lineEdit_second_fit_tau.setEnabled(enabled)
+        self.label_second_fit_tau_unit.setEnabled(enabled)
+
+    def _get_secondary_fit_settings(self):
+        """读取二次拟合设置。"""
+        checkbox = getattr(self, "checkBox_second_fit", None)
+        tau_edit = getattr(self, "lineEdit_second_fit_tau", None)
+        enabled = checkbox is not None and checkbox.isChecked()
+        tau_text = tau_edit.text() if tau_edit is not None else ""
+        tau_n = self._safe_float_conversion(tau_text, 5.0)
+        if not np.isfinite(tau_n) or tau_n <= 0:
+            tau_n = 5.0
+        return enabled, float(tau_n)
 
     def _hide_oxidation_section(self):
         """完全隐藏氧化参数相关控件。"""
@@ -2825,6 +2922,7 @@ class mainWindow(QMainWindow, main_window):
             upper = self._read_param_block([
                 self.lineEdit_16, self.lineEdit_17, self.lineEdit_18, self.lineEdit_35, self.lineEdit_38
             ])
+        enable_second_fit, second_fit_tau_multiplier = self._get_secondary_fit_settings()
 
         return {
             'file_path': file_path,
@@ -2836,6 +2934,8 @@ class mainWindow(QMainWindow, main_window):
             'start': start,
             'lower': lower,
             'upper': upper,
+            'enable_second_fit': enable_second_fit,
+            'second_fit_tau_multiplier': second_fit_tau_multiplier,
             'fit_options': self.get_fit_options(),
             'robust_text': self.comboBox_8.currentText(),
             'algorithm_text': self.comboBox_9.currentText()
@@ -2855,6 +2955,7 @@ class mainWindow(QMainWindow, main_window):
                 fit_output['y_for_display'],
                 fit_output['x_for_fitting'],
                 fit_output['y_for_fitting'],
+                fit_output.get('x_for_curve'),
                 fitter
             )
         else:
@@ -2948,7 +3049,7 @@ class mainWindow(QMainWindow, main_window):
             print(f"设置拟合器选项时出错: {str(e)}")
             return fitter
 
-    def _handle_fit_result(self, result, models_to_test, x_for_display, y_for_display, x_for_fitting, y_for_fitting, fitter):
+    def _handle_fit_result(self, result, models_to_test, x_for_display, y_for_display, x_for_fitting, y_for_fitting, x_for_curve, fitter):
         """处理拟合结果"""
         try:
             # 确保模型类型信息被保存
@@ -2998,9 +3099,9 @@ class mainWindow(QMainWindow, main_window):
             # 绘制结果 - 在显示数据范围上绘制拟合曲线
             model_def = fitter._get_model_definition(models_to_test)
             if model_def:
-                # 在显示范围内计算拟合曲线
-                y_pred_full = model_def['function'](x_for_display, *result.params)
-                self.fig1fig2_plot(x_for_display, y_for_display, x_for_fitting, y_for_fitting, y_pred_full, models_to_test, x_for_display)
+                curve_x = x_for_display if x_for_curve is None else np.asarray(x_for_curve)
+                y_pred_full = model_def['function'](curve_x, *result.params)
+                self.fig1fig2_plot(x_for_display, y_for_display, x_for_fitting, y_for_fitting, y_pred_full, models_to_test, curve_x)
             
             print("拟合完成:", result)
             
