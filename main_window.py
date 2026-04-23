@@ -47,7 +47,7 @@ TARGET_TOL_C = 0.5
 TARGET_HOLD_S = 20.0
 SERIAL_PROBE_TIMEOUT_S = 0.1
 PRESS_CONTROL_SLAVE = 2
-FNAME_RE = re.compile(r"^T(\\d{4})(CH[1-4](?:CH[1-4])*)?\\.CSV$", re.IGNORECASE)
+FNAME_RE = re.compile(r"^T(\d+)(?:[_-]?(CH[1-4](?:CH[1-4])*))?\.CSV$", re.IGNORECASE)
 
 
 class TaskStoppedError(Exception):
@@ -380,7 +380,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
     def __init__(self):
         super().__init__()
         self.settings = QSettings("AutoLifeCal", "ScopeSaver")
-        self.selected_channels = {"CH1"}
+        self.selected_channels = {"CH2"}
         self.resource_str = None
         self.idn = None
         self.allowed_avg_counts = [2, 4, 8, 16, 32, 64, 128, 256, 512]
@@ -745,8 +745,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.update_settings_tooltip()
         hot_ok, hot_sn = self.get_hotplate_identity_status()
         sig_ok, sig_sn = self.get_siggen_identity_status()
-        self.start_hotplate_live_poll()
-        scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
+        resume_live, resume_plot = self._suspend_hotplate_live_poll()
+        try:
+            scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
+        finally:
+            self._resume_hotplate_live_poll(resume_live, resume_plot)
+        if hot_ok:
+            self.start_hotplate_live_poll()
         self.append_status(
             f"[初始化] 标定台: 端口={self.hotplate_com_port}, SN={hot_sn}, 连接={'是' if hot_ok else '否'}"
         )
@@ -763,9 +768,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         hot_ok, hot_sn = self.get_hotplate_identity_status()
         sig_ok, sig_sn = self.get_siggen_identity_status()
+        resume_live, resume_plot = self._suspend_hotplate_live_poll()
+        try:
+            scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
+        finally:
+            self._resume_hotplate_live_poll(resume_live, resume_plot)
         if hot_ok:
             self.start_hotplate_live_poll()
-        scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
 
         self.append_status(
             f"[自动初始化] 标定台: 端口={self.hotplate_com_port}, SN={hot_sn}, 连接={'是' if hot_ok else '否'}"
@@ -777,6 +786,22 @@ class MainWindow(LaserLifetimeCalibrationUI):
             f"[自动初始化] 信号发生器: 端口={self.siggen_com_port or '未配置'}, 状态={sig_sn}, 连接={'是' if sig_ok else '否'}, 通道={','.join(sorted(self.siggen_channels)) or '无'}"
         )
         return scope_ok, hot_ok, sig_ok
+
+    def _suspend_hotplate_live_poll(self):
+        live_active = self.hotplate_live_timer.isActive()
+        plot_active = self.hotplate_plot_timer.isActive()
+        if live_active:
+            self.hotplate_live_timer.stop()
+        if plot_active:
+            self.hotplate_plot_timer.stop()
+        return live_active, plot_active
+
+    def _resume_hotplate_live_poll(self, live_active: bool, plot_active: bool):
+        if live_active and not self.hotplate_live_timer.isActive():
+            self.hotplate_live_timer.start()
+        if plot_active and not self.hotplate_plot_timer.isActive():
+            self.last_sim_ts = time.time()
+            self.hotplate_plot_timer.start()
 
     def _probe_port_once(self, port, baud, cmd):
         ser = None
