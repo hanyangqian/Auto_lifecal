@@ -37,7 +37,7 @@ from laser_lifetime_calibration_ui import LaserLifetimeCalibrationUI
 
 SERIAL_LOCK = "C030795"
 DEFAULT_TIMEOUT_MS = 20000
-CURVE_TIMEOUT_MS = 3000
+CURVE_TIMEOUT_MS = 12000
 DISCOVERY_TIMEOUT_MS = 1500
 HOTPLATE_BAUD_CANDIDATES = (9600, 115200)
 HOTPLATE_QUERY_WAIT_S = 0.35
@@ -319,17 +319,47 @@ def read_waveform(scope, ch_name: str):
     _w(scope, f"DATA:STOP {recl}")
 
     is_big_endian = width == 2 and "MSB" in byt_or
-    with temporary_timeout(scope, CURVE_TIMEOUT_MS):
-        with binary_transfer_mode(scope):
-            raw = scope.query_binary_values(
-                "CURVE?",
-                datatype=dtype,
-                container=np.array,
-                is_big_endian=is_big_endian,
-                expect_termination=False,
-                chunk_size=1024 * 1024,
-            )
-    drain_input_buffer(scope)
+    raw = None
+    transfer_error = None
+    for attempt in range(1, 3):
+        try:
+            with temporary_timeout(scope, CURVE_TIMEOUT_MS):
+                with binary_transfer_mode(scope):
+                    raw = scope.query_binary_values(
+                        "CURVE?",
+                        datatype=dtype,
+                        container=np.array,
+                        is_big_endian=is_big_endian,
+                        expect_termination=False,
+                        chunk_size=1024 * 1024,
+                    )
+            transfer_error = None
+            break
+        except Exception as ex:
+            transfer_error = ex
+            try:
+                scope.clear()
+            except Exception:
+                pass
+            try:
+                scope.write("*CLS")
+            except Exception:
+                pass
+            try:
+                drain_input_buffer(scope, timeout_ms=80)
+            except Exception:
+                pass
+            if attempt < 2:
+                time.sleep(0.18)
+                continue
+
+    if transfer_error is not None or raw is None:
+        raise RuntimeError(f"{ch_name} 波形读取失败（CURVE传输超时/中断）: {transfer_error}")
+
+    try:
+        drain_input_buffer(scope, timeout_ms=80)
+    except Exception:
+        pass
 
     if len(raw) != recl:
         recl = len(raw)
@@ -1298,6 +1328,48 @@ class MainWindow(LaserLifetimeCalibrationUI):
         rm, scope, _ = open_scope(self.resource_str)
         return rm, scope
 
+    def _close_scope_session(self, rm, scope, reason: str = ""):
+        try:
+            if scope:
+                try:
+                    _w(scope, "ACQ:STATE STOP", retry=1, sleep_s=0.02)
+                except Exception:
+                    pass
+                clear_session(scope)
+                scope.close()
+        except Exception as ex:
+            if reason:
+                self.append_status(f"[示波器] 会话关闭异常（{reason}）: {ex}")
+        finally:
+            try:
+                if rm:
+                    rm.close()
+            except Exception as ex:
+                if reason:
+                    self.append_status(f"[示波器] 资源管理器关闭异常（{reason}）: {ex}")
+
+    def _open_scope_session_with_recovery(self, reason: str = "采集", max_attempts: int = 2):
+        errors = []
+        for attempt in range(1, max_attempts + 1):
+            rm = scope = None
+            try:
+                if not self.resource_str:
+                    ok, _ = self.try_lock_scope(show_error=False, verbose=False)
+                    if not ok:
+                        raise RuntimeError("示波器未锁定")
+                rm, scope, _ = open_scope(self.resource_str)
+                clear_session(scope)
+                return rm, scope
+            except Exception as ex:
+                errors.append(f"第{attempt}次: {ex}")
+                self._close_scope_session(rm, scope)
+                self.append_status(f"[示波器] 会话打开失败（{reason}，第{attempt}次）: {ex}")
+                if attempt < max_attempts:
+                    self.append_status("[示波器] 正在尝试重新锁定并重连...")
+                    self.try_lock_scope(show_error=False, verbose=False)
+                    time.sleep(0.35)
+        raise RuntimeError(f"示波器重连失败（{reason}）\n" + "\n".join(errors))
+
     def try_lock_scope(self, show_error=True, verbose=True):
         try:
             device_info = discover_scope_resource_robust(SERIAL_LOCK)
@@ -1559,7 +1631,6 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.start_btn.setChecked(False)
             return
 
-        rm = scope = None
         try:
             self._init_run_log_files(save_dir)
             self.data_log_enabled = True
@@ -1569,10 +1640,6 @@ class MainWindow(LaserLifetimeCalibrationUI):
             cycles = int(self.cycles_spin.value())
             if cycles < 1:
                 raise RuntimeError("循环次数必须大于等于 1")
-
-            rm, scope, _ = open_scope(self.resource_str)
-            clear_session(scope)
-            self.apply_acquire_settings(scope)
 
             self.persist_save_path()
             start_idx = next_index(save_dir)
@@ -1594,9 +1661,18 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self._apply_stage_setpoints(stage["temp"], stage["press"])
                 self.wait_for_temp_press_stable()
                 self.wait_light_source_stable()
-                stage_files, start_idx = self._run_scope_cycles_for_stage(
-                    scope, save_dir, start_idx, cycles, i, stage_total
-                )
+                rm_stage = scope_stage = None
+                try:
+                    rm_stage, scope_stage = self._open_scope_session_with_recovery(
+                        reason=f"阶段 {i}/{stage_total} 采集前",
+                        max_attempts=2,
+                    )
+                    self.apply_acquire_settings(scope_stage)
+                    stage_files, start_idx = self._run_scope_cycles_for_stage(
+                        scope_stage, save_dir, start_idx, cycles, i, stage_total
+                    )
+                finally:
+                    self._close_scope_session(rm_stage, scope_stage, reason=f"阶段 {i}/{stage_total} 完成")
                 saved_files.extend(stage_files)
                 try:
                     self._set_siggen_output(False)
@@ -1638,16 +1714,6 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.data_log_enabled = False
             self.sensor_log_file_path = None
             self.status_log_file_path = None
-            try:
-                if scope:
-                    scope.close()
-            except Exception:
-                pass
-            try:
-                if rm:
-                    rm.close()
-            except Exception:
-                pass
 
     def _send_hotplate_commands(self, commands):
         if serial is None:
