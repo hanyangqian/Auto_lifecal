@@ -1370,6 +1370,22 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     time.sleep(0.35)
         raise RuntimeError(f"示波器重连失败（{reason}）\n" + "\n".join(errors))
 
+    @staticmethod
+    def _is_scope_recoverable_error(ex: Exception) -> bool:
+        if isinstance(ex, pyvisa.errors.VisaIOError):
+            return True
+        text = str(ex).upper()
+        markers = (
+            "TIMEOUT",
+            "TIMED OUT",
+            "VI_ERROR",
+            "CONN_LOST",
+            "CONNECTION LOST",
+            "CURVE传输超时",
+            "波形读取失败",
+        )
+        return any(m in text for m in markers)
+
     def try_lock_scope(self, show_error=True, verbose=True):
         try:
             device_info = discover_scope_resource_robust(SERIAL_LOCK)
@@ -1661,18 +1677,55 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self._apply_stage_setpoints(stage["temp"], stage["press"])
                 self.wait_for_temp_press_stable()
                 self.wait_light_source_stable()
-                rm_stage = scope_stage = None
-                try:
-                    rm_stage, scope_stage = self._open_scope_session_with_recovery(
-                        reason=f"阶段 {i}/{stage_total} 采集前",
-                        max_attempts=2,
-                    )
-                    self.apply_acquire_settings(scope_stage)
-                    stage_files, start_idx = self._run_scope_cycles_for_stage(
-                        scope_stage, save_dir, start_idx, cycles, i, stage_total
-                    )
-                finally:
-                    self._close_scope_session(rm_stage, scope_stage, reason=f"阶段 {i}/{stage_total} 完成")
+                stage_start_idx = start_idx
+                stage_end_target = stage_start_idx + cycles
+                remaining = cycles
+                resume_attempts = 0
+                max_resume_attempts = 6
+                while remaining > 0:
+                    rm_stage = scope_stage = None
+                    try:
+                        rm_stage, scope_stage = self._open_scope_session_with_recovery(
+                            reason=f"阶段 {i}/{stage_total} 采集前",
+                            max_attempts=2,
+                        )
+                        self.apply_acquire_settings(scope_stage)
+                        _, start_idx = self._run_scope_cycles_for_stage(
+                            scope_stage, save_dir, start_idx, remaining, i, stage_total
+                        )
+                        remaining = 0
+                    except TaskStoppedError:
+                        raise
+                    except Exception as ex:
+                        resume_attempts += 1
+                        if (not self._is_scope_recoverable_error(ex)) or resume_attempts > max_resume_attempts:
+                            raise
+                        self.append_status(
+                            f"[示波器] 阶段 {i}/{stage_total} 采集中断（可恢复）: {ex}"
+                        )
+                        self.append_status(
+                            f"[示波器] 正在自动重连并断点续采（第 {resume_attempts}/{max_resume_attempts} 次）..."
+                        )
+                        recovered_idx = max(start_idx, next_index(save_dir))
+                        progressed = recovered_idx - start_idx
+                        if progressed > 0:
+                            self.append_status(
+                                f"[示波器] 已检测到本阶段新增 {progressed} 个文件，按断点继续"
+                            )
+                        start_idx = recovered_idx
+                        remaining = max(0, stage_end_target - start_idx)
+                        if remaining > 0:
+                            self.try_lock_scope(show_error=False, verbose=False)
+                            time.sleep(0.4)
+                    finally:
+                        self._close_scope_session(
+                            rm_stage, scope_stage, reason=f"阶段 {i}/{stage_total} 子流程结束"
+                        )
+
+                stage_files = [
+                    os.path.join(save_dir, make_filename(idx, self.selected_channels))
+                    for idx in range(stage_start_idx, min(start_idx, stage_end_target))
+                ]
                 saved_files.extend(stage_files)
                 try:
                     self._set_siggen_output(False)
