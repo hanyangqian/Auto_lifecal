@@ -38,6 +38,7 @@ from laser_lifetime_calibration_ui import LaserLifetimeCalibrationUI
 SERIAL_LOCK = "C030795"
 DEFAULT_TIMEOUT_MS = 20000
 CURVE_TIMEOUT_MS = 12000
+SCREENSHOT_TIMEOUT_MS = 20000
 DISCOVERY_TIMEOUT_MS = 1500
 HOTPLATE_BAUD_CANDIDATES = (9600, 115200)
 HOTPLATE_QUERY_WAIT_S = 0.35
@@ -45,6 +46,7 @@ PLOT_TICK_S = 0.2
 SIGGEN_BAUD = 115200
 TARGET_TOL_C = 0.5
 TARGET_HOLD_S = 20.0
+MAX_RAMP_RATE = 20.0
 SERIAL_PROBE_TIMEOUT_S = 0.1
 PRESS_CONTROL_SLAVE = 2
 FNAME_RE = re.compile(r"^T(\d+)(?:[_-]?(CH[1-4](?:CH[1-4])*))?\.CSV$", re.IGNORECASE)
@@ -402,8 +404,46 @@ def make_filename(idx: int, channels):
     return f"T{idx:04d}{suffix}.CSV"
 
 
+def make_screenshot_filename(idx: int, channels):
+    name, _ = os.path.splitext(make_filename(idx, channels))
+    return f"{name}.PNG"
+
+
 def save_csv(save_path: str, data: dict):
     pd.DataFrame(data).to_csv(save_path, index=False)
+
+
+def _extract_scpi_block_payload(raw: bytes) -> bytes:
+    if raw.startswith(b"#") and len(raw) >= 2 and raw[1:2].isdigit():
+        digit_count = int(raw[1:2])
+        if digit_count > 0:
+            len_start = 2
+            len_end = len_start + digit_count
+            data_len = int(raw[len_start:len_end])
+            return raw[len_end:len_end + data_len]
+        return raw[2:].rstrip(b"\r\n")
+
+    png_start = raw.find(b"\x89PNG\r\n\x1a\n")
+    if png_start > 0:
+        return raw[png_start:].rstrip(b"\r\n")
+    return raw.rstrip(b"\r\n")
+
+
+def save_scope_screenshot(scope, save_path: str):
+    old_timeout = scope.timeout
+    try:
+        _w(scope, "SAVe:IMAGe:FILEFormat PNG")
+        with temporary_timeout(scope, SCREENSHOT_TIMEOUT_MS):
+            with binary_transfer_mode(scope):
+                scope.write("HARDCopy START")
+                raw = scope.read_raw()
+        image_data = _extract_scpi_block_payload(raw)
+        if not image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise RuntimeError("示波器返回的截屏数据不是有效 PNG")
+        with open(save_path, "wb") as f:
+            f.write(image_data)
+    finally:
+        scope.timeout = old_timeout
 
 
 class MainWindow(LaserLifetimeCalibrationUI):
@@ -1411,20 +1451,46 @@ class MainWindow(LaserLifetimeCalibrationUI):
     def _build_axis_values(start: float, step: float, end: float, name: str) -> list[float]:
         if step <= 0:
             raise RuntimeError(f"{name} 步进必须大于 0")
-        if end < start:
-            raise RuntimeError(f"{name} 终点必须大于等于起点（当前: {start} -> {end}）")
 
         values: list[float] = []
         cur = start
         eps = max(abs(step) * 1e-9, 1e-9)
+        direction = 1 if end >= start else -1
         guard = 0
-        while cur <= end + eps:
+        while (direction > 0 and cur <= end + eps) or (direction < 0 and cur >= end - eps):
             values.append(round(cur, 6))
-            cur += step
+            cur += direction * step
             guard += 1
             if guard > 20000:
                 raise RuntimeError(f"{name} 阶段数量异常，请检查范围与步进")
         return values
+
+    @staticmethod
+    def _rate_limit_message(name: str, rate: float, unit: str) -> str:
+        return f"{name}不能大于 {MAX_RAMP_RATE:g} {unit}（当前: {rate:.2f} {unit}）"
+
+    def _validate_auto_ramp_rates(self) -> bool:
+        if self.temp_cal_btn.isChecked() and (self.temp_mode_combo.currentData() or "RAMP") == "RAMP":
+            rate = float(self.temp_auto_rate_spin.value())
+            if rate > MAX_RAMP_RATE:
+                QMessageBox.warning(
+                    self,
+                    "标定台参数错误",
+                    self._rate_limit_message("升温速率", rate, "℃/min"),
+                )
+                return False
+
+        if self.press_cal_btn.isChecked() and (self.press_mode_combo.currentData() or "RAMP") == "RAMP":
+            rate = float(self.press_auto_rate_spin.value())
+            if rate > MAX_RAMP_RATE:
+                QMessageBox.warning(
+                    self,
+                    "压力参数错误",
+                    self._rate_limit_message("升压速率", rate, "kPa/min"),
+                )
+                return False
+
+        return True
 
     def _build_stage_targets(self) -> list[dict]:
         need_temp = self.temp_cal_btn.isChecked()
@@ -1448,19 +1514,14 @@ class MainWindow(LaserLifetimeCalibrationUI):
             )
 
         if need_temp and need_press:
-            stage_count = max(len(temp_vals), len(press_vals))
-            if len(temp_vals) != len(press_vals):
-                self.append_status(
-                    f"[阶段] 温度阶段数={len(temp_vals)}，压力阶段数={len(press_vals)}，将对较短轴保持末值补齐到 {stage_count} 阶段"
-                )
             stages = []
-            for i in range(stage_count):
-                stages.append(
-                    {
-                        "temp": float(temp_vals[min(i, len(temp_vals) - 1)]),
-                        "press": float(press_vals[min(i, len(press_vals) - 1)]),
-                    }
-                )
+            for temp in temp_vals:
+                for press in press_vals:
+                    stages.append({"temp": float(temp), "press": float(press)})
+            self.append_status(
+                f"[阶段] 温度阶段数={len(temp_vals)}，压力阶段数={len(press_vals)}，"
+                f"按温度优先遍历共 {len(stages)} 阶段"
+            )
             return stages
 
         if need_temp:
@@ -1560,6 +1621,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
             base_time = None
             idx = start_idx + n
             csv_path = os.path.join(save_dir, make_filename(idx, self.selected_channels))
+            screenshot_path = os.path.join(save_dir, make_screenshot_filename(idx, self.selected_channels))
+            save_scope_screenshot(scope, screenshot_path)
+            self.append_status(
+                f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] 截屏完成: {screenshot_path}"
+            )
 
             for ch in sorted(self.selected_channels):
                 if self.stop_requested.is_set():
@@ -1634,6 +1700,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         if not save_dir:
             QMessageBox.warning(self, "提示", "请先选择保存路径")
+            self.start_btn.setChecked(False)
+            return
+        if not self._validate_auto_ramp_rates():
             self.start_btn.setChecked(False)
             return
 
@@ -2111,6 +2180,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if rate <= 0:
             QMessageBox.warning(self, "标定台参数错误", "Rate 必须大于 0")
             return
+        if rate > MAX_RAMP_RATE:
+            QMessageBox.warning(
+                self,
+                "标定台参数错误",
+                self._rate_limit_message("升温速率", rate, "℃/min"),
+            )
+            return
         try:
             self._send_hotplate_commands(
                 [
@@ -2173,6 +2249,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
         prate = float(self.hotplate_prate_spin.value())
         if prate <= 0:
             QMessageBox.warning(self, "压力参数错误", "P-Rate 必须大于 0")
+            return
+        if prate > MAX_RAMP_RATE:
+            QMessageBox.warning(
+                self,
+                "压力参数错误",
+                self._rate_limit_message("升压速率", prate, "kPa/min"),
+            )
             return
         try:
             self._send_hotplate_commands(
