@@ -2024,11 +2024,6 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self.reach_inband_since = None
                 inband_sec = 0.0
 
-            self.append_status(
-                f"[标定台] RAMP-JUDGE tc={tc_now:.3f}, target={target:.3f}, diff={diff:.3f}, "
-                f"inband={inband_sec:.1f}/{TARGET_HOLD_S:.0f}s, tf={tf_rt}, tt={tt_rt}, err={err_code}"
-            )
-
             if (not self.reach_confirmed) and inband_sec >= TARGET_HOLD_S:
                 self.reach_confirmed = True
                 self.append_status(

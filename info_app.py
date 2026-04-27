@@ -553,12 +553,40 @@ class MATLABCurveFitter:
                 bounds_lower[baseline_idx] = max(bounds_lower[baseline_idx], np.min(y) - y_range * 0.1)
                 bounds_upper[baseline_idx] = min(bounds_upper[baseline_idx], np.max(y))
 
-            # 如果是双指数模型，添加 t1 < t2 的约束
+            # 双指数衰减的物理约束：
+            # A1/A2 不能为负；I0 是背景强度，不能为负，也不应高于数据上界；
+            # 远大于采样窗口的 tau 无法从当前数据中可靠辨识，容易退化成负基线 + 超慢分量。
             if len(param_names) >= 5 and 't1' in param_names and 't2' in param_names:
+                a_idx = param_names.index('a')
                 t1_idx = param_names.index('t1')
+                a2_idx = param_names.index('c')
                 t2_idx = param_names.index('t2')
-                # 确保 t1 < t2 的边界约束
-                bounds_upper[t1_idx] = min(bounds_upper[t1_idx], bounds_upper[t2_idx])  # t1 的上限不超过 t2 的上限
+                baseline_idx = param_names.index('e')
+
+                y_min = float(np.nanmin(y))
+                y_max = float(np.nanmax(y))
+                y_range = y_max - y_min
+                if not np.isfinite(y_range) or y_range <= 0:
+                    y_range = max(abs(y_max), 1.0)
+
+                x_span = abs(x[-1] - x[0]) if len(x) > 1 else max(abs(x[0]), 1.0)
+                dt = abs(np.mean(np.diff(x))) if len(x) > 1 else max(abs(x[0]), 1e-9)
+                min_tau = max(dt * 0.01, 1e-12)
+                max_identifiable_tau = max(x_span * 5.0, min_tau * 10.0)
+
+                bounds_lower[a_idx] = max(bounds_lower[a_idx], 0.0)
+                bounds_lower[a2_idx] = max(bounds_lower[a2_idx], 0.0)
+                bounds_upper[a_idx] = min(bounds_upper[a_idx], y_range * 10.0)
+                bounds_upper[a2_idx] = min(bounds_upper[a2_idx], y_range * 10.0)
+
+                bounds_lower[t1_idx] = max(bounds_lower[t1_idx], min_tau)
+                bounds_lower[t2_idx] = max(bounds_lower[t2_idx], min_tau)
+                bounds_upper[t1_idx] = min(bounds_upper[t1_idx], max_identifiable_tau)
+                bounds_upper[t2_idx] = min(bounds_upper[t2_idx], max_identifiable_tau)
+                bounds_upper[t1_idx] = min(bounds_upper[t1_idx], bounds_upper[t2_idx])
+
+                bounds_lower[baseline_idx] = max(bounds_lower[baseline_idx], 0.0)
+                bounds_upper[baseline_idx] = min(bounds_upper[baseline_idx], y_max)
 
         # 修正非法边界并将初值投影到边界内部
         invalid_bounds = bounds_lower >= bounds_upper
