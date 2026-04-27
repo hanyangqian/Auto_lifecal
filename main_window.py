@@ -5,6 +5,7 @@ import sys
 import time
 import traceback
 import threading
+import gc
 from contextlib import contextmanager
 from typing import Set
 
@@ -40,6 +41,7 @@ DEFAULT_TIMEOUT_MS = 20000
 CURVE_TIMEOUT_MS = 12000
 SCREENSHOT_TIMEOUT_MS = 20000
 DISCOVERY_TIMEOUT_MS = 1500
+SCOPE_RECOVERY_CLEAR_TIMEOUT_MS = 1000
 HOTPLATE_BAUD_CANDIDATES = (9600, 115200)
 HOTPLATE_QUERY_WAIT_S = 0.35
 PLOT_TICK_S = 0.2
@@ -192,6 +194,46 @@ def open_scope(resource_str: str):
     scope.write_termination = "\n"
     idn = scope.query("*IDN?")
     return rm, scope, idn
+
+
+def force_clear_scope_resource(resource_str: str):
+    if not resource_str:
+        return None
+
+    rm = scope = None
+    try:
+        rm = pyvisa.ResourceManager()
+        scope = rm.open_resource(resource_str)
+        scope.timeout = SCOPE_RECOVERY_CLEAR_TIMEOUT_MS
+        scope.read_termination = "\n"
+        scope.write_termination = "\n"
+        try:
+            scope.clear()
+        except Exception:
+            pass
+        try:
+            scope.write("*CLS")
+        except Exception:
+            pass
+        try:
+            drain_input_buffer(scope, timeout_ms=80)
+        except Exception:
+            pass
+        return None
+    except Exception as ex:
+        return str(ex)
+    finally:
+        try:
+            if scope:
+                scope.close()
+        except Exception:
+            pass
+        try:
+            if rm:
+                rm.close()
+        except Exception:
+            pass
+        gc.collect()
 
 
 def clear_session(scope):
@@ -1388,10 +1430,24 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 if reason:
                     self.append_status(f"[示波器] 资源管理器关闭异常（{reason}）: {ex}")
 
-    def _open_scope_session_with_recovery(self, reason: str = "采集", max_attempts: int = 2):
+    def _recover_scope_connection(self, reason: str, previous_resource: str | None, attempt: int):
+        self.append_status(f"[示波器] 正在执行强恢复（{reason}，第{attempt}次）...")
+        if previous_resource:
+            clear_error = force_clear_scope_resource(previous_resource)
+            if clear_error:
+                self.append_status(f"[示波器] 旧资源清理未完成: {clear_error}")
+
+        self.resource_str = None
+        self.idn = None
+        QApplication.processEvents()
+        time.sleep(min(0.6 * attempt, 2.5))
+        self.try_lock_scope(show_error=False, verbose=False)
+
+    def _open_scope_session_with_recovery(self, reason: str = "采集", max_attempts: int = 4):
         errors = []
         for attempt in range(1, max_attempts + 1):
             rm = scope = None
+            previous_resource = self.resource_str
             try:
                 if not self.resource_str:
                     ok, _ = self.try_lock_scope(show_error=False, verbose=False)
@@ -1405,9 +1461,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self._close_scope_session(rm, scope)
                 self.append_status(f"[示波器] 会话打开失败（{reason}，第{attempt}次）: {ex}")
                 if attempt < max_attempts:
-                    self.append_status("[示波器] 正在尝试重新锁定并重连...")
-                    self.try_lock_scope(show_error=False, verbose=False)
-                    time.sleep(0.35)
+                    self._recover_scope_connection(reason, previous_resource, attempt)
         raise RuntimeError(f"示波器重连失败（{reason}）\n" + "\n".join(errors))
 
     @staticmethod
@@ -1423,6 +1477,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
             "CONNECTION LOST",
             "CURVE传输超时",
             "波形读取失败",
+            "截屏",
+            "HARDCOPY",
+            "USB",
+            "DEVICE",
         )
         return any(m in text for m in markers)
 
@@ -1756,7 +1814,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     try:
                         rm_stage, scope_stage = self._open_scope_session_with_recovery(
                             reason=f"阶段 {i}/{stage_total} 采集前",
-                            max_attempts=2,
+                            max_attempts=4,
                         )
                         self.apply_acquire_settings(scope_stage)
                         _, start_idx = self._run_scope_cycles_for_stage(
@@ -1784,8 +1842,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         start_idx = recovered_idx
                         remaining = max(0, stage_end_target - start_idx)
                         if remaining > 0:
-                            self.try_lock_scope(show_error=False, verbose=False)
-                            time.sleep(0.4)
+                            self._recover_scope_connection(
+                                f"阶段 {i}/{stage_total} 断点续采",
+                                self.resource_str,
+                                resume_attempts,
+                            )
                     finally:
                         self._close_scope_session(
                             rm_stage, scope_stage, reason=f"阶段 {i}/{stage_total} 子流程结束"
