@@ -18,7 +18,7 @@ try:
 except ImportError:
     serial = None
     list_ports = None
-from PyQt5.QtCore import QSettings, QTimer
+from PyQt5.QtCore import Qt, QSettings, QTimer
 from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -31,6 +31,12 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QGridLayout,
     QLabel,
+    QHBoxLayout,
+    QDoubleSpinBox,
+    QAbstractSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
 )
 
 from laser_lifetime_calibration_ui import LaserLifetimeCalibrationUI
@@ -582,15 +588,298 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.hotplate_pstop_btn.clicked.connect(self.send_hotplate_press_stop)
         self.fit_settings_btn.clicked.connect(self.open_lifetime_fit_settings)
         self.fit_enable_btn.toggled.connect(self.on_fit_enable_toggled)
+        self.temp_custom_btn.toggled.connect(lambda checked: self.on_custom_axis_toggled("temp", checked))
+        self.press_custom_btn.toggled.connect(lambda checked: self.on_custom_axis_toggled("press", checked))
+        self.temp_custom_edit_btn.clicked.connect(lambda: self.edit_custom_axis_path("temp"))
+        self.press_custom_edit_btn.clicked.connect(lambda: self.edit_custom_axis_path("press"))
 
         self.on_avg_toggled(self.avg_checkbox.isChecked())
+        self._sync_custom_axis_ui("temp", self.temp_custom_btn.isChecked())
+        self._sync_custom_axis_ui("press", self.press_custom_btn.isChecked())
 
         self.load_port_settings()
         self.load_saved_path()
         self.load_fit_enable_setting()
+        self.load_custom_axis_settings()
         self.settings_button.hide()
         self._ui_init_done = True
         self.append_status("[系统] 已加载主窗口")
+
+    def _sync_custom_axis_ui(self, axis: str, checked: bool):
+        if axis == "temp":
+            btn = self.temp_custom_btn
+            edit_btn = self.temp_custom_edit_btn
+            controls = [
+                self.temp_range_start_spin,
+                self.temp_range_step_spin,
+                self.temp_range_end_spin,
+                self.temp_mode_combo,
+                self.temp_auto_rate_spin,
+            ]
+            if checked:
+                self.temp_mode_combo.setCurrentIndex(self.temp_mode_combo.findData("RAMP"))
+        else:
+            btn = self.press_custom_btn
+            edit_btn = self.press_custom_edit_btn
+            controls = [
+                self.press_range_start_spin,
+                self.press_range_step_spin,
+                self.press_range_end_spin,
+                self.press_mode_combo,
+                self.press_auto_rate_spin,
+            ]
+            if checked:
+                self.press_mode_combo.setCurrentIndex(self.press_mode_combo.findData("RAMP"))
+
+        btn.setText("自定义" if checked else "范围")
+        edit_btn.setEnabled(checked)
+        for control in controls:
+            control.setEnabled(not checked)
+
+    def on_custom_axis_toggled(self, axis: str, checked: bool):
+        self._sync_custom_axis_ui(axis, checked)
+        if self._ui_init_done:
+            self.persist_custom_axis_settings()
+
+    def _manual_axis_defaults(self, axis: str):
+        if axis == "temp":
+            return "温度", "℃", "℃/min", -50.0, 800.0, "新建升温"
+        return "压力", "kPa", "kPa/min", 0.0, 5000.0, "新建升压"
+
+    def _make_path_spin(self, value: float, min_value: float, max_value: float, decimals: int = 3):
+        spin = QDoubleSpinBox()
+        spin.setRange(min_value, max_value)
+        spin.setDecimals(decimals)
+        spin.setValue(value)
+        spin.setSingleStep(1.0)
+        spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        return spin
+
+    @staticmethod
+    def _make_table_item(value, editable: bool = True):
+        item = QTableWidgetItem(str(value))
+        flags = item.flags()
+        if editable:
+            item.setFlags(flags | Qt.ItemIsEditable)
+        else:
+            item.setFlags(flags & ~Qt.ItemIsEditable)
+            item.setForeground(Qt.gray)
+            item.setBackground(Qt.lightGray)
+        return item
+
+    @staticmethod
+    def _ensure_table_item(table, row: int, column: int, value: str = ""):
+        item = table.item(row, column)
+        if item is None:
+            item = QTableWidgetItem(value)
+            table.setItem(row, column, item)
+        return item
+
+    @staticmethod
+    def _table_float(table, row: int, column: int) -> float:
+        text = table.item(row, column).text().strip()
+        return float(text)
+
+    def _sync_axis_segment_starts(self, table):
+        for row in range(1, table.rowCount()):
+            prev_end_item = table.item(row - 1, 2)
+            if prev_end_item is None:
+                continue
+            prev_end = prev_end_item.text()
+            item = self._ensure_table_item(table, row, 0, prev_end)
+            if item.text() != prev_end:
+                item.setText(prev_end)
+
+    def _refresh_axis_start_editability(self, table):
+        for row in range(table.rowCount()):
+            item = self._ensure_table_item(table, row, 0)
+            if row == 0:
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
+                item.setForeground(Qt.black)
+                item.setBackground(Qt.white)
+            else:
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setForeground(Qt.gray)
+                item.setBackground(Qt.lightGray)
+
+    def _add_axis_segment_row(self, table, axis: str, segment: dict | None = None):
+        _, _, _, min_value, max_value, _ = self._manual_axis_defaults(axis)
+        row = table.rowCount()
+        if segment is None:
+            prev_end = None
+            if row > 0:
+                prev_end = self._table_float(table, row - 1, 2)
+            start = prev_end if prev_end is not None else (float(self.ref_temp_spin.value()) if axis == "temp" else float(self.ref_press_spin.value()))
+            step = 10.0 if axis == "temp" else 5.0
+            end = start + step
+            mode = "RAMP"
+            rate = 5.0
+        else:
+            start = float(segment["start"])
+            step = float(segment["step"])
+            end = float(segment["end"])
+            mode = segment.get("mode") or "RAMP"
+            rate = float(segment.get("rate") or 5.0)
+
+        table.insertRow(row)
+        table.blockSignals(True)
+        table.setItem(row, 0, self._make_table_item(f"{start:g}", editable=(row == 0)))
+        table.setItem(row, 1, self._make_table_item(f"{step:g}"))
+        table.setItem(row, 2, self._make_table_item(f"{end:g}"))
+        table.setItem(row, 3, self._make_table_item("Hold" if mode == "HOLD" else "Ramp"))
+        table.setItem(row, 4, self._make_table_item("" if mode == "HOLD" else f"{rate:g}", editable=(mode != "HOLD")))
+        table.blockSignals(False)
+        table.selectRow(row)
+
+    def _segments_from_axis_table(self, table) -> list[dict]:
+        segments = []
+        for row in range(table.rowCount()):
+            mode_text = table.item(row, 3).text().strip().upper()
+            if mode_text not in {"RAMP", "HOLD"}:
+                raise RuntimeError(f"第 {row + 1} 段方式必须是 Ramp 或 Hold")
+            rate = None if mode_text == "HOLD" else self._table_float(table, row, 4)
+            segment = {
+                "start": self._table_float(table, row, 0),
+                "step": self._table_float(table, row, 1),
+                "end": self._table_float(table, row, 2),
+                "mode": mode_text,
+                "rate": rate,
+            }
+            segments.append(segment)
+        return segments
+
+    @staticmethod
+    def _serialize_manual_axis_segments(segments: list[dict]) -> str:
+        lines = []
+        for segment in segments:
+            rate = "h" if segment["mode"] == "HOLD" else f"{float(segment['rate']):g}"
+            lines.append(
+                f"{float(segment['start']):g}|{float(segment['step']):g}|"
+                f"{float(segment['end']):g}|{segment['mode']}|{rate}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_serialized_manual_axis(text: str) -> list[dict] | None:
+        lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+        if not lines or not all("|" in line for line in lines):
+            return None
+        segments = []
+        for line in lines:
+            parts = [part.strip() for part in line.split("|")]
+            if len(parts) != 5:
+                return None
+            start, step, end = (float(parts[i]) for i in range(3))
+            mode = parts[3].upper()
+            if mode not in {"RAMP", "HOLD"}:
+                return None
+            rate = None if mode == "HOLD" else float(parts[4])
+            segments.append({"start": start, "step": step, "end": end, "mode": mode, "rate": rate})
+        return segments
+
+    def edit_custom_axis_path(self, axis: str):
+        axis_name, value_unit, unit, _, _, add_text = self._manual_axis_defaults(axis)
+        edit = self.temp_manual_points_edit if axis == "temp" else self.press_manual_points_edit
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"编辑自定义{axis_name}路径")
+        dialog.resize(760, 360)
+        layout = QHBoxLayout(dialog)
+        table = QTableWidget(0, 5, dialog)
+        table.setHorizontalHeaderLabels([f"起点({value_unit})", f"间隔({value_unit})", f"终点({value_unit})", "方式", f"速率({unit})"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setStyleSheet(
+            "QTableWidget { gridline-color: #c6d2de; }"
+            "QTableWidget::item:selected {"
+            "background-color: #a9d4ff;"
+            "color: #102033;"
+            "}"
+        )
+        layout.addWidget(table, 1)
+
+        button_layout = QVBoxLayout()
+        add_btn = QPushButton(add_text)
+        del_btn = QPushButton("删除选中段")
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_layout.addWidget(add_btn)
+        button_layout.addWidget(del_btn)
+        button_layout.addStretch(1)
+        button_layout.addWidget(buttons)
+        layout.addLayout(button_layout)
+
+        segments = self._parse_serialized_manual_axis(edit.text()) or []
+        for segment in segments:
+            self._add_axis_segment_row(table, axis, segment)
+        if table.rowCount() == 0:
+            self._add_axis_segment_row(table, axis)
+
+        add_btn.clicked.connect(lambda: self._add_axis_segment_row(table, axis))
+
+        table_syncing = {"active": False}
+
+        def sync_after_edit(item):
+            if table_syncing["active"]:
+                return
+            table_syncing["active"] = True
+            try:
+                row = item.row()
+                column = item.column()
+                if column == 2:
+                    self._sync_axis_segment_starts(table)
+                elif column == 3:
+                    rate_item = table.item(row, 4)
+                    if rate_item is None:
+                        return
+                    mode = item.text().strip().upper()
+                    if mode == "HOLD":
+                        item.setText("Hold")
+                        rate_item.setText("")
+                        rate_item.setFlags(rate_item.flags() & ~Qt.ItemIsEditable)
+                        rate_item.setForeground(Qt.gray)
+                        rate_item.setBackground(Qt.lightGray)
+                    else:
+                        item.setText("Ramp")
+                        rate_item.setFlags(rate_item.flags() | Qt.ItemIsEditable)
+                        rate_item.setForeground(Qt.black)
+                        rate_item.setBackground(Qt.white)
+                        if not rate_item.text().strip():
+                            rate_item.setText("5")
+            finally:
+                table_syncing["active"] = False
+
+        table.itemChanged.connect(sync_after_edit)
+
+        def delete_selected():
+            row = table.currentRow()
+            if row >= 0:
+                table.removeRow(row)
+                self._refresh_axis_start_editability(table)
+                self._sync_axis_segment_starts(table)
+
+        del_btn.clicked.connect(delete_selected)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        segments = self._segments_from_axis_table(table)
+        text = self._serialize_manual_axis_segments(segments)
+        try:
+            targets = self._build_manual_axis_targets(text, axis_name)
+        except RuntimeError as ex:
+            QMessageBox.warning(self, "自定义路径格式错误", str(ex))
+            return
+
+        edit.setText(text.strip())
+        segment_count, detail = self._describe_manual_axis_targets(targets, value_unit, unit)
+        self.append_status(
+            f"[阶段] 已更新自定义{axis_name}路径: {segment_count} 段，{len(targets)} 个目标点；{detail}"
+        )
+        self.persist_custom_axis_settings()
 
     def append_status(self, text: str):
         line = self._append_log(self.status_log_text, text)
@@ -628,14 +917,24 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 )
 
     def _init_run_log_files(self, save_dir: str):
+        sensor_snapshot = self.sensor_log_text.toPlainText().strip()
+        status_snapshot = self.status_log_text.toPlainText().strip()
         self.sensor_log_file_path = os.path.join(save_dir, "温压状态日志.log")
         self.status_log_file_path = os.path.join(save_dir, "运行事件日志.log")
         self._log_write_err_reported = False
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         header = f"\n========== 自动寿命标定启动 {stamp} ==========\n"
-        for file_path in (self.sensor_log_file_path, self.status_log_file_path):
+        snapshots = (
+            (self.sensor_log_file_path, "启动前温压状态日志", sensor_snapshot),
+            (self.status_log_file_path, "启动前运行事件日志", status_snapshot),
+        )
+        for file_path, title, snapshot in snapshots:
             with open(file_path, "a", encoding="utf-8") as f:
                 f.write(header)
+                if snapshot:
+                    f.write(f"------ {title} ------\n")
+                    f.write(snapshot + "\n")
+                    f.write("------ 启动后追加日志 ------\n")
 
     def _update_channel_button_text(self):
         self.channel_btn.setText("、".join(sorted(self.selected_channels)))
@@ -674,6 +973,20 @@ class MainWindow(LaserLifetimeCalibrationUI):
     def load_fit_enable_setting(self):
         enabled = self.settings.value("fit_after_run_enabled", True, type=bool)
         self.fit_enable_btn.setChecked(bool(enabled))
+
+    def load_custom_axis_settings(self):
+        self.temp_manual_points_edit.setText(self.settings.value("temp_manual_path", "", type=str))
+        self.press_manual_points_edit.setText(self.settings.value("press_manual_path", "", type=str))
+        self.temp_custom_btn.setChecked(self.settings.value("temp_custom_enabled", False, type=bool))
+        self.press_custom_btn.setChecked(self.settings.value("press_custom_enabled", False, type=bool))
+        self._sync_custom_axis_ui("temp", self.temp_custom_btn.isChecked())
+        self._sync_custom_axis_ui("press", self.press_custom_btn.isChecked())
+
+    def persist_custom_axis_settings(self):
+        self.settings.setValue("temp_custom_enabled", bool(self.temp_custom_btn.isChecked()))
+        self.settings.setValue("press_custom_enabled", bool(self.press_custom_btn.isChecked()))
+        self.settings.setValue("temp_manual_path", self.temp_manual_points_edit.text().strip())
+        self.settings.setValue("press_manual_path", self.press_manual_points_edit.text().strip())
 
     def on_fit_enable_toggled(self, checked: bool):
         self.settings.setValue("fit_after_run_enabled", bool(checked))
@@ -1167,6 +1480,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
             return False, f"失败: {str(ex)[:32]}"
 
     def poll_hotplate_live_data(self):
+        if not self.data_log_enabled:
+            return
         if not (self.hotplate_com_port or "").strip():
             return
         try:
@@ -1523,30 +1838,157 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 raise RuntimeError(f"{name} 阶段数量异常，请检查范围与步进")
         return values
 
+    def _build_range_axis_targets(self, start: float, step: float, end: float, name: str) -> list[dict]:
+        return [{"value": float(v), "rate": None, "mode": None} for v in self._build_axis_values(start, step, end, name)]
+
+    @staticmethod
+    def _build_manual_axis_targets(text: str, name: str) -> list[dict]:
+        text = text.strip()
+        if not text:
+            return []
+
+        serialized_segments = MainWindow._parse_serialized_manual_axis(text)
+        if serialized_segments is not None:
+            targets: list[dict] = []
+            eps = 1e-9
+            for segment in serialized_segments:
+                start = float(segment["start"])
+                step = float(segment["step"])
+                end = float(segment["end"])
+                mode = segment["mode"]
+                rate = segment["rate"]
+                if step <= 0:
+                    raise RuntimeError(f"{name}自定义路径间隔必须大于 0（当前: {step}）")
+                if targets and abs(targets[-1]["value"] - start) > eps:
+                    raise RuntimeError(
+                        f"{name}自定义路径不连续：上一段终点 {targets[-1]['value']:.6g}，"
+                        f"下一段起点 {start:.6g}"
+                    )
+
+                direction = 1 if end >= start else -1
+                cur = start
+                while (direction > 0 and cur <= end + eps) or (direction < 0 and cur >= end - eps):
+                    if not targets or abs(targets[-1]["value"] - cur) > eps:
+                        targets.append({"value": round(cur, 6), "rate": rate, "mode": mode})
+                    cur += direction * step
+                if not targets or abs(targets[-1]["value"] - end) > eps:
+                    targets.append({"value": end, "rate": rate, "mode": mode})
+            return targets
+
+        targets: list[dict] = []
+        segments = [part.strip() for part in re.split(r"[;；\n]+", text) if part.strip()]
+        for segment in segments:
+            match = re.match(
+                r"^\s*([-+]?\d+(?:\.\d+)?)\s*(?:->|→|-|,|:|：)\s*(h|\d+(?:\.\d+)?)\s*(?:->|→|-|,|:|：)\s*([-+]?\d+(?:\.\d+)?)\s*$",
+                segment,
+                re.IGNORECASE,
+            )
+            if not match:
+                raise RuntimeError(f"{name}自定义路径格式错误，请使用: 起点-速率-终点 或 起点-h-终点")
+
+            start_text, mode_text, end_text = match.groups()
+            start = float(start_text)
+            end = float(end_text)
+            if mode_text.lower() == "h":
+                mode = "HOLD"
+                rate = None
+            else:
+                mode = "RAMP"
+                rate = float(mode_text)
+                if rate <= 0:
+                    raise RuntimeError(f"{name}自定义路径速率必须大于 0（当前: {rate}）")
+
+            if targets and abs(targets[-1]["value"] - start) > 1e-9:
+                raise RuntimeError(
+                    f"{name}自定义路径不连续：上一段终点 {targets[-1]['value']:.6g}，"
+                    f"下一段起点 {start:.6g}"
+                )
+
+            if not targets:
+                targets.append({"value": start, "rate": rate, "mode": mode})
+            targets.append({"value": end, "rate": rate, "mode": mode})
+
+        return targets
+
+    @staticmethod
+    def _describe_manual_axis_targets(targets: list[dict], value_unit: str, rate_unit: str) -> tuple[int, str]:
+        if len(targets) < 2:
+            return 0, "(空)"
+
+        parts = []
+        for i in range(1, len(targets)):
+            start = targets[i - 1]["value"]
+            end = targets[i]["value"]
+            mode = targets[i].get("mode")
+            rate = targets[i].get("rate")
+            if mode == "HOLD":
+                parts.append(f"{i}. {start:g}{value_unit} -> HOLD -> {end:g}{value_unit}")
+            else:
+                parts.append(f"{i}. {start:g}{value_unit} -> {rate:g}{rate_unit} -> {end:g}{value_unit}")
+        return len(parts), "; ".join(parts)
+
+    def _build_temp_axis_targets(self) -> list[dict]:
+        if self.temp_custom_btn.isChecked():
+            manual = self._build_manual_axis_targets(self.temp_manual_points_edit.text(), "温度")
+            if not manual:
+                raise RuntimeError("已开启自定义升温，请先编辑温度路径")
+            return manual
+        return self._build_range_axis_targets(
+            float(self.temp_range_start_spin.value()),
+            float(self.temp_range_step_spin.value()),
+            float(self.temp_range_end_spin.value()),
+            "温度范围",
+        )
+
+    def _build_press_axis_targets(self) -> list[dict]:
+        if self.press_custom_btn.isChecked():
+            manual = self._build_manual_axis_targets(self.press_manual_points_edit.text(), "压力")
+            if not manual:
+                raise RuntimeError("已开启自定义升压，请先编辑压力路径")
+            return manual
+        return self._build_range_axis_targets(
+            float(self.press_range_start_spin.value()),
+            float(self.press_range_step_spin.value()),
+            float(self.press_range_end_spin.value()),
+            "压力范围",
+        )
+
     @staticmethod
     def _rate_limit_message(name: str, rate: float, unit: str) -> str:
         return f"{name}不能大于 {MAX_RAMP_RATE:g} {unit}（当前: {rate:.2f} {unit}）"
 
-    def _validate_auto_ramp_rates(self) -> bool:
-        if self.temp_cal_btn.isChecked() and (self.temp_mode_combo.currentData() or "RAMP") == "RAMP":
-            rate = float(self.temp_auto_rate_spin.value())
-            if rate > MAX_RAMP_RATE:
-                QMessageBox.warning(
-                    self,
-                    "标定台参数错误",
-                    self._rate_limit_message("升温速率", rate, "℃/min"),
-                )
-                return False
+    def _validate_ramp_rate(self, title: str, name: str, rate: float, unit: str) -> bool:
+        if rate > MAX_RAMP_RATE:
+            QMessageBox.warning(
+                self,
+                title,
+                self._rate_limit_message(name, rate, unit),
+            )
+            return False
+        return True
 
-        if self.press_cal_btn.isChecked() and (self.press_mode_combo.currentData() or "RAMP") == "RAMP":
-            rate = float(self.press_auto_rate_spin.value())
-            if rate > MAX_RAMP_RATE:
-                QMessageBox.warning(
-                    self,
-                    "压力参数错误",
-                    self._rate_limit_message("升压速率", rate, "kPa/min"),
-                )
-                return False
+    def _validate_auto_ramp_rates(self) -> bool:
+        try:
+            if self.temp_cal_btn.isChecked() and (self.temp_mode_combo.currentData() or "RAMP") == "RAMP":
+                temp_targets = self._build_temp_axis_targets()
+                rates = [item["rate"] for item in temp_targets if item["rate"] is not None]
+                if not rates and not self.temp_custom_btn.isChecked():
+                    rates = [float(self.temp_auto_rate_spin.value())]
+                for rate in rates:
+                    if not self._validate_ramp_rate("标定台参数错误", "升温速率", float(rate), "℃/min"):
+                        return False
+
+            if self.press_cal_btn.isChecked() and (self.press_mode_combo.currentData() or "RAMP") == "RAMP":
+                press_targets = self._build_press_axis_targets()
+                rates = [item["rate"] for item in press_targets if item["rate"] is not None]
+                if not rates and not self.press_custom_btn.isChecked():
+                    rates = [float(self.press_auto_rate_spin.value())]
+                for rate in rates:
+                    if not self._validate_ramp_rate("压力参数错误", "升压速率", float(rate), "kPa/min"):
+                        return False
+        except RuntimeError as ex:
+            QMessageBox.warning(self, "标定路径参数错误", str(ex))
+            return False
 
         return True
 
@@ -1554,46 +1996,83 @@ class MainWindow(LaserLifetimeCalibrationUI):
         need_temp = self.temp_cal_btn.isChecked()
         need_press = self.press_cal_btn.isChecked()
 
-        temp_vals = [None]
-        press_vals = [None]
+        temp_targets = [{"value": None, "rate": None}]
+        press_targets = [{"value": None, "rate": None}]
         if need_temp:
-            temp_vals = self._build_axis_values(
-                float(self.temp_range_start_spin.value()),
-                float(self.temp_range_step_spin.value()),
-                float(self.temp_range_end_spin.value()),
-                "温度范围",
-            )
+            temp_targets = self._build_temp_axis_targets()
+            if self.temp_custom_btn.isChecked():
+                segment_count, detail = self._describe_manual_axis_targets(temp_targets, "℃", "℃/min")
+                self.append_status(
+                    f"[阶段] 自定义温度路径: {segment_count} 段，{len(temp_targets)} 个目标点；{detail}"
+                )
         if need_press:
-            press_vals = self._build_axis_values(
-                float(self.press_range_start_spin.value()),
-                float(self.press_range_step_spin.value()),
-                float(self.press_range_end_spin.value()),
-                "压力范围",
-            )
+            press_targets = self._build_press_axis_targets()
+            if self.press_custom_btn.isChecked():
+                segment_count, detail = self._describe_manual_axis_targets(press_targets, "kPa", "kPa/min")
+                self.append_status(
+                    f"[阶段] 自定义压力路径: {segment_count} 段，{len(press_targets)} 个目标点；{detail}"
+                )
 
         if need_temp and need_press:
             stages = []
-            for temp in temp_vals:
-                for press in press_vals:
-                    stages.append({"temp": float(temp), "press": float(press)})
+            for temp in temp_targets:
+                for press in press_targets:
+                    stages.append(
+                        {
+                            "temp": float(temp["value"]),
+                            "temp_rate": temp["rate"],
+                            "temp_mode": temp.get("mode"),
+                            "press": float(press["value"]),
+                            "press_rate": press["rate"],
+                            "press_mode": press.get("mode"),
+                        }
+                    )
             self.append_status(
-                f"[阶段] 温度阶段数={len(temp_vals)}，压力阶段数={len(press_vals)}，"
+                f"[阶段] 温度阶段数={len(temp_targets)}，压力阶段数={len(press_targets)}，"
                 f"按温度优先遍历共 {len(stages)} 阶段"
             )
             return stages
 
         if need_temp:
-            return [{"temp": float(v), "press": None} for v in temp_vals]
+            return [
+                {
+                    "temp": float(item["value"]),
+                    "temp_rate": item["rate"],
+                    "temp_mode": item.get("mode"),
+                    "press": None,
+                    "press_rate": None,
+                    "press_mode": None,
+                }
+                for item in temp_targets
+            ]
         if need_press:
-            return [{"temp": None, "press": float(v)} for v in press_vals]
-        return [{"temp": None, "press": None}]
+            return [
+                {
+                    "temp": None,
+                    "temp_rate": None,
+                    "temp_mode": None,
+                    "press": float(item["value"]),
+                    "press_rate": item["rate"],
+                    "press_mode": item.get("mode"),
+                }
+                for item in press_targets
+            ]
+        return [{"temp": None, "temp_rate": None, "temp_mode": None, "press": None, "press_rate": None, "press_mode": None}]
 
-    def _apply_stage_setpoints(self, temp_target: float | None, press_target: float | None):
+    def _apply_stage_setpoints(
+        self,
+        temp_target: float | None,
+        press_target: float | None,
+        temp_rate: float | None = None,
+        press_rate: float | None = None,
+        temp_mode_override: str | None = None,
+        press_mode_override: str | None = None,
+    ):
         if temp_target is not None:
             self.ref_temp_spin.setValue(temp_target)
             self.hotplate_tf_spin.setValue(temp_target)
-            mode = self.temp_mode_combo.currentData() or "RAMP"
-            rate = float(self.temp_auto_rate_spin.value())
+            mode = temp_mode_override or self.temp_mode_combo.currentData() or "RAMP"
+            rate = float(temp_rate if temp_rate is not None else self.temp_auto_rate_spin.value())
             self.hotplate_rate_spin.setValue(rate)
             if mode == "RAMP":
                 self._send_hotplate_commands(
@@ -1631,8 +2110,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if press_target is not None:
             self.ref_press_spin.setValue(press_target)
             self.hotplate_pf_spin.setValue(press_target)
-            mode = self.press_mode_combo.currentData() or "RAMP"
-            rate = float(self.press_auto_rate_spin.value())
+            mode = press_mode_override or self.press_mode_combo.currentData() or "RAMP"
+            rate = float(press_rate if press_rate is not None else self.press_auto_rate_spin.value())
             self.hotplate_prate_spin.setValue(rate)
             if mode == "RAMP":
                 self._send_hotplate_commands(
@@ -1798,10 +2277,25 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 if self.stop_requested.is_set():
                     raise TaskStoppedError("用户已停止任务")
                 t_txt = "保持当前" if stage["temp"] is None else f"{stage['temp']:.2f}℃"
+                if stage.get("temp_rate") is not None:
+                    t_txt += f" @ {float(stage['temp_rate']):.2f}℃/min"
+                elif stage.get("temp_mode") == "HOLD":
+                    t_txt += " @ HOLD"
                 p_txt = "保持当前" if stage["press"] is None else f"{stage['press']:.2f}kPa"
+                if stage.get("press_rate") is not None:
+                    p_txt += f" @ {float(stage['press_rate']):.2f}kPa/min"
+                elif stage.get("press_mode") == "HOLD":
+                    p_txt += " @ HOLD"
                 self.append_status(f"[阶段 {i}/{stage_total}] 目标: 温度={t_txt}, 压力={p_txt}")
 
-                self._apply_stage_setpoints(stage["temp"], stage["press"])
+                self._apply_stage_setpoints(
+                    stage["temp"],
+                    stage["press"],
+                    stage.get("temp_rate"),
+                    stage.get("press_rate"),
+                    stage.get("temp_mode"),
+                    stage.get("press_mode"),
+                )
                 self.wait_for_temp_press_stable()
                 self.wait_light_source_stable()
                 stage_start_idx = start_idx

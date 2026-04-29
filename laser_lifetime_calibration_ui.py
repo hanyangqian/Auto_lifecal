@@ -396,6 +396,23 @@ class LaserLifetimeCalibrationUI(QWidget):
         self.temp_auto_rate_spin = QDoubleSpinBox(); self.temp_auto_rate_spin.setRange(0.1, 100); self.temp_auto_rate_spin.setDecimals(2); self.temp_auto_rate_spin.setValue(5.0)
         temp_grid.addWidget(self.temp_auto_rate_spin, 3, 3)
 
+        temp_grid.addWidget(QLabel("自定义升温:"), 4, 0)
+        temp_custom_row = QFrame()
+        temp_custom_layout = QHBoxLayout(temp_custom_row)
+        temp_custom_layout.setContentsMargins(0, 0, 0, 0)
+        temp_custom_layout.setSpacing(8)
+        self.temp_custom_btn = QPushButton("关闭")
+        self.temp_custom_btn.setObjectName("CalToggleButton")
+        self.temp_custom_btn.setCheckable(True)
+        self.temp_custom_edit_btn = QPushButton("编辑温度路径")
+        self.temp_custom_edit_btn.setEnabled(False)
+        self.temp_manual_points_edit = QLineEdit()
+        self.temp_manual_points_edit.setVisible(False)
+        temp_custom_layout.addWidget(self.temp_custom_btn, 1)
+        temp_custom_layout.addWidget(self.temp_custom_edit_btn, 2)
+        temp_custom_layout.addWidget(self.temp_manual_points_edit)
+        temp_grid.addWidget(temp_custom_row, 4, 1, 1, 3)
+
         temp_box.setLayout(temp_grid)
 
         press_box = PanelBox("压力标定")
@@ -445,6 +462,23 @@ class LaserLifetimeCalibrationUI(QWidget):
         press_grid.addWidget(QLabel("升压速率 (kPa/min):"), 3, 2)
         self.press_auto_rate_spin = QDoubleSpinBox(); self.press_auto_rate_spin.setRange(0.1, 1000); self.press_auto_rate_spin.setDecimals(2); self.press_auto_rate_spin.setValue(5.0)
         press_grid.addWidget(self.press_auto_rate_spin, 3, 3)
+
+        press_grid.addWidget(QLabel("自定义升压:"), 4, 0)
+        press_custom_row = QFrame()
+        press_custom_layout = QHBoxLayout(press_custom_row)
+        press_custom_layout.setContentsMargins(0, 0, 0, 0)
+        press_custom_layout.setSpacing(8)
+        self.press_custom_btn = QPushButton("关闭")
+        self.press_custom_btn.setObjectName("CalToggleButton")
+        self.press_custom_btn.setCheckable(True)
+        self.press_custom_edit_btn = QPushButton("编辑压力路径")
+        self.press_custom_edit_btn.setEnabled(False)
+        self.press_manual_points_edit = QLineEdit()
+        self.press_manual_points_edit.setVisible(False)
+        press_custom_layout.addWidget(self.press_custom_btn, 1)
+        press_custom_layout.addWidget(self.press_custom_edit_btn, 2)
+        press_custom_layout.addWidget(self.press_manual_points_edit)
+        press_grid.addWidget(press_custom_row, 4, 1, 1, 3)
 
         press_box.setLayout(press_grid)
 
@@ -707,6 +741,11 @@ class LaserLifetimeCalibrationUI(QWidget):
             }
             QPushButton:hover {
                 background: #dfe8f1;
+            }
+            QPushButton:disabled {
+                background: #eef1f4;
+                color: #8e98a3;
+                border: 1px dashed #c3ccd6;
             }
             QPushButton#AccentButton {
                 background: #2d79c7;
