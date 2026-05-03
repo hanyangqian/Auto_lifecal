@@ -1419,54 +1419,6 @@ class MainWindow(LaserLifetimeCalibrationUI):
             except Exception:
                 pass
 
-    @staticmethod
-    def _parse_siggen_output_status(value: str) -> bool | None:
-        text = (value or "").strip()
-        if not re.fullmatch(r"\d+", text):
-            return None
-        return int(text) != 0
-
-    def _read_siggen_output_statuses(self) -> dict[str, bool | None]:
-        return {
-            "CH1": self._parse_siggen_output_status(self._query_siggen("RMN")),
-            "CH2": self._parse_siggen_output_status(self._query_siggen("RFN")),
-        }
-
-    @staticmethod
-    def _format_siggen_output_statuses(statuses: dict[str, bool | None]) -> str:
-        def fmt(ch):
-            state = statuses.get(ch)
-            if state is True:
-                return f"{ch}=ON"
-            if state is False:
-                return f"{ch}=OFF"
-            return f"{ch}=未知"
-
-        return f"{fmt('CH1')}, {fmt('CH2')}"
-
-    def _verify_siggen_output(self, channels: list[str], enable: bool) -> dict[str, bool | None]:
-        statuses = self._read_siggen_output_statuses()
-        failed = [ch for ch in channels if statuses.get(ch) is not enable]
-        if not failed:
-            return statuses
-
-        retry_cmds = []
-        for ch in failed:
-            if ch == "CH1":
-                retry_cmds.append("WMN1" if enable else "WMN0")
-            elif ch == "CH2":
-                retry_cmds.append("WFN1" if enable else "WFN0")
-        if retry_cmds:
-            self._send_siggen_commands(retry_cmds)
-            statuses = self._read_siggen_output_statuses()
-
-        failed = [ch for ch in channels if statuses.get(ch) is not enable]
-        if failed:
-            state = "ON" if enable else "OFF"
-            actual = self._format_siggen_output_statuses(statuses)
-            raise RuntimeError(f"信号发生器通道 {','.join(failed)} 未切换到 {state}（实际: {actual}）")
-        return statuses
-
     def _set_siggen_output(self, enable: bool):
         channels = [ch for ch in sorted(self.siggen_channels) if ch in {"CH1", "CH2"}]
         if not channels:
@@ -1480,10 +1432,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if not cmds:
             return
         self._send_siggen_commands(cmds)
-        statuses = self._verify_siggen_output(channels, enable)
         state = "ON" if enable else "OFF"
-        actual = self._format_siggen_output_statuses(statuses)
-        self.append_status(f"[信号发生器] 通道 {','.join(channels)} 输出 -> {state}（确认: {actual}）")
+        self.append_status(f"[信号发生器] 通道 {','.join(channels)} 输出命令已发送 -> {state}")
 
     def get_siggen_identity_status(self):
         if not (self.siggen_com_port or "").strip():
