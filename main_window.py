@@ -32,11 +32,10 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QLabel,
     QHBoxLayout,
-    QDoubleSpinBox,
-    QAbstractSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QStyledItemDelegate,
 )
 
 from laser_lifetime_calibration_ui import LaserLifetimeCalibrationUI
@@ -52,6 +51,7 @@ HOTPLATE_BAUD_CANDIDATES = (9600, 115200)
 HOTPLATE_QUERY_WAIT_S = 0.35
 PLOT_TICK_S = 0.2
 SIGGEN_BAUD = 115200
+SIGGEN_COMMAND_DELAY_S = 0.2
 TARGET_TOL_C = 0.5
 TARGET_HOLD_S = 20.0
 MAX_RAMP_RATE = 20.0
@@ -86,6 +86,21 @@ class ChannelDialog(QDialog):
 
     def get_selected(self) -> Set[str]:
         return {name for name, cb in self.checks.items() if cb.isChecked()}
+
+
+class AxisModeDelegate(QStyledItemDelegate):
+    def createEditor(self, parent, option, index):
+        combo = QComboBox(parent)
+        combo.addItem("Ramp", "RAMP")
+        combo.addItem("Hold", "HOLD")
+        return combo
+
+    def setEditorData(self, editor, index):
+        mode = (index.data(Qt.EditRole) or index.data(Qt.DisplayRole) or "Ramp").strip().upper()
+        editor.setCurrentIndex(1 if mode == "HOLD" else 0)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText(), Qt.EditRole)
 
 
 def _parse_idn(idn: str):
@@ -646,25 +661,21 @@ class MainWindow(LaserLifetimeCalibrationUI):
             return "温度", "℃", "℃/min", -50.0, 800.0, "新建升温"
         return "压力", "kPa", "kPa/min", 0.0, 5000.0, "新建升压"
 
-    def _make_path_spin(self, value: float, min_value: float, max_value: float, decimals: int = 3):
-        spin = QDoubleSpinBox()
-        spin.setRange(min_value, max_value)
-        spin.setDecimals(decimals)
-        spin.setValue(value)
-        spin.setSingleStep(1.0)
-        spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        return spin
-
     @staticmethod
-    def _make_table_item(value, editable: bool = True):
-        item = QTableWidgetItem(str(value))
+    def _set_table_item_editable(item, editable: bool):
         flags = item.flags()
         if editable:
             item.setFlags(flags | Qt.ItemIsEditable)
+            item.setForeground(Qt.black)
+            item.setBackground(Qt.white)
         else:
             item.setFlags(flags & ~Qt.ItemIsEditable)
             item.setForeground(Qt.gray)
             item.setBackground(Qt.lightGray)
+
+    def _make_table_item(self, value, editable: bool = True):
+        item = QTableWidgetItem(str(value))
+        self._set_table_item_editable(item, editable)
         return item
 
     @staticmethod
@@ -677,8 +688,41 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     @staticmethod
     def _table_float(table, row: int, column: int) -> float:
-        text = table.item(row, column).text().strip()
-        return float(text)
+        item = table.item(row, column)
+        text = "" if item is None else item.text().strip()
+        try:
+            value = float(text)
+        except ValueError:
+            raise RuntimeError(f"第 {row + 1} 段第 {column + 1} 列必须填写数字")
+        if not np.isfinite(value):
+            raise RuntimeError(f"第 {row + 1} 段第 {column + 1} 列数字无效")
+        return value
+
+    @staticmethod
+    def _normalize_axis_mode(text: str) -> str | None:
+        mode = text.strip().upper()
+        if mode in {"RAMP", "R"}:
+            return "RAMP"
+        if mode in {"HOLD", "H"}:
+            return "HOLD"
+        return None
+
+    def _axis_table_mode(self, table, row: int) -> str | None:
+        item = table.item(row, 3)
+        mode_text = "" if item is None else item.text()
+        return self._normalize_axis_mode(mode_text)
+
+    def _sync_axis_mode_rate_cell(self, table, row: int, mode: str):
+        if row < 0:
+            return
+        rate_item = self._ensure_table_item(table, row, 4)
+        if mode == "HOLD":
+            rate_item.setText("")
+            self._set_table_item_editable(rate_item, False)
+        else:
+            self._set_table_item_editable(rate_item, True)
+            if not rate_item.text().strip():
+                rate_item.setText("5")
 
     def _sync_axis_segment_starts(self, table):
         for row in range(1, table.rowCount()):
@@ -694,16 +738,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
         for row in range(table.rowCount()):
             item = self._ensure_table_item(table, row, 0)
             if row == 0:
-                item.setFlags(item.flags() | Qt.ItemIsEditable)
-                item.setForeground(Qt.black)
-                item.setBackground(Qt.white)
+                self._set_table_item_editable(item, True)
             else:
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                item.setForeground(Qt.gray)
-                item.setBackground(Qt.lightGray)
+                self._set_table_item_editable(item, False)
 
     def _add_axis_segment_row(self, table, axis: str, segment: dict | None = None):
-        _, _, _, min_value, max_value, _ = self._manual_axis_defaults(axis)
         row = table.rowCount()
         if segment is None:
             prev_end = None
@@ -734,15 +773,19 @@ class MainWindow(LaserLifetimeCalibrationUI):
     def _segments_from_axis_table(self, table) -> list[dict]:
         segments = []
         for row in range(table.rowCount()):
-            mode_text = table.item(row, 3).text().strip().upper()
-            if mode_text not in {"RAMP", "HOLD"}:
+            mode = self._axis_table_mode(table, row)
+            if mode is None:
                 raise RuntimeError(f"第 {row + 1} 段方式必须是 Ramp 或 Hold")
-            rate = None if mode_text == "HOLD" else self._table_float(table, row, 4)
+            rate = None
+            if mode == "RAMP":
+                rate = self._table_float(table, row, 4)
+                if rate <= 0:
+                    raise RuntimeError(f"第 {row + 1} 段 Ramp 速率必须大于 0")
             segment = {
                 "start": self._table_float(table, row, 0),
                 "step": self._table_float(table, row, 1),
                 "end": self._table_float(table, row, 2),
-                "mode": mode_text,
+                "mode": mode,
                 "rate": rate,
             }
             segments.append(segment)
@@ -769,11 +812,24 @@ class MainWindow(LaserLifetimeCalibrationUI):
             parts = [part.strip() for part in line.split("|")]
             if len(parts) != 5:
                 return None
-            start, step, end = (float(parts[i]) for i in range(3))
+            try:
+                start, step, end = (float(parts[i]) for i in range(3))
+            except ValueError:
+                return None
+            if not all(np.isfinite(v) for v in (start, step, end)):
+                return None
             mode = parts[3].upper()
             if mode not in {"RAMP", "HOLD"}:
                 return None
-            rate = None if mode == "HOLD" else float(parts[4])
+            if mode == "HOLD":
+                rate = None
+            else:
+                try:
+                    rate = float(parts[4])
+                except ValueError:
+                    return None
+                if not np.isfinite(rate):
+                    return None
             segments.append({"start": start, "step": step, "end": end, "mode": mode, "rate": rate})
         return segments
 
@@ -791,6 +847,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         table.verticalHeader().setVisible(False)
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setItemDelegateForColumn(3, AxisModeDelegate(table))
         table.setStyleSheet(
             "QTableWidget { gridline-color: #c6d2de; }"
             "QTableWidget::item:selected {"
@@ -833,18 +890,16 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     rate_item = table.item(row, 4)
                     if rate_item is None:
                         return
-                    mode = item.text().strip().upper()
+                    mode = self._normalize_axis_mode(item.text())
+                    if mode is None:
+                        return
                     if mode == "HOLD":
                         item.setText("Hold")
                         rate_item.setText("")
-                        rate_item.setFlags(rate_item.flags() & ~Qt.ItemIsEditable)
-                        rate_item.setForeground(Qt.gray)
-                        rate_item.setBackground(Qt.lightGray)
+                        self._set_table_item_editable(rate_item, False)
                     else:
                         item.setText("Ramp")
-                        rate_item.setFlags(rate_item.flags() | Qt.ItemIsEditable)
-                        rate_item.setForeground(Qt.black)
-                        rate_item.setBackground(Qt.white)
+                        self._set_table_item_editable(rate_item, True)
                         if not rate_item.text().strip():
                             rate_item.setText("5")
             finally:
@@ -866,7 +921,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if dialog.exec_() != QDialog.Accepted:
             return
 
-        segments = self._segments_from_axis_table(table)
+        try:
+            segments = self._segments_from_axis_table(table)
+        except RuntimeError as ex:
+            QMessageBox.warning(self, "自定义路径格式错误", str(ex))
+            return
         text = self._serialize_manual_axis_segments(segments)
         try:
             targets = self._build_manual_axis_targets(text, axis_name)
@@ -1352,13 +1411,61 @@ class MainWindow(LaserLifetimeCalibrationUI):
             for cmd in commands:
                 ser.write((cmd + "\n").encode("ascii"))
                 ser.flush()
-                time.sleep(0.05)
+                time.sleep(SIGGEN_COMMAND_DELAY_S)
         finally:
             try:
                 if ser and ser.is_open:
                     ser.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _parse_siggen_output_status(value: str) -> bool | None:
+        text = (value or "").strip()
+        if not re.fullmatch(r"\d+", text):
+            return None
+        return int(text) != 0
+
+    def _read_siggen_output_statuses(self) -> dict[str, bool | None]:
+        return {
+            "CH1": self._parse_siggen_output_status(self._query_siggen("RMN")),
+            "CH2": self._parse_siggen_output_status(self._query_siggen("RFN")),
+        }
+
+    @staticmethod
+    def _format_siggen_output_statuses(statuses: dict[str, bool | None]) -> str:
+        def fmt(ch):
+            state = statuses.get(ch)
+            if state is True:
+                return f"{ch}=ON"
+            if state is False:
+                return f"{ch}=OFF"
+            return f"{ch}=未知"
+
+        return f"{fmt('CH1')}, {fmt('CH2')}"
+
+    def _verify_siggen_output(self, channels: list[str], enable: bool) -> dict[str, bool | None]:
+        statuses = self._read_siggen_output_statuses()
+        failed = [ch for ch in channels if statuses.get(ch) is not enable]
+        if not failed:
+            return statuses
+
+        retry_cmds = []
+        for ch in failed:
+            if ch == "CH1":
+                retry_cmds.append("WMN1" if enable else "WMN0")
+            elif ch == "CH2":
+                retry_cmds.append("WFN1" if enable else "WFN0")
+        if retry_cmds:
+            self._send_siggen_commands(retry_cmds)
+            statuses = self._read_siggen_output_statuses()
+
+        failed = [ch for ch in channels if statuses.get(ch) is not enable]
+        if failed:
+            state = "ON" if enable else "OFF"
+            actual = self._format_siggen_output_statuses(statuses)
+            raise RuntimeError(f"信号发生器通道 {','.join(failed)} 未切换到 {state}（实际: {actual}）")
+        return statuses
 
     def _set_siggen_output(self, enable: bool):
         channels = [ch for ch in sorted(self.siggen_channels) if ch in {"CH1", "CH2"}]
@@ -1373,8 +1480,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if not cmds:
             return
         self._send_siggen_commands(cmds)
+        statuses = self._verify_siggen_output(channels, enable)
         state = "ON" if enable else "OFF"
-        self.append_status(f"[信号发生器] 通道 {','.join(channels)} 输出 -> {state}")
+        actual = self._format_siggen_output_statuses(statuses)
+        self.append_status(f"[信号发生器] 通道 {','.join(channels)} 输出 -> {state}（确认: {actual}）")
 
     def get_siggen_identity_status(self):
         if not (self.siggen_com_port or "").strip():
@@ -1857,8 +1966,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 end = float(segment["end"])
                 mode = segment["mode"]
                 rate = segment["rate"]
+                if not all(np.isfinite(v) for v in (start, step, end)):
+                    raise RuntimeError(f"{name}自定义路径包含无效数字")
                 if step <= 0:
                     raise RuntimeError(f"{name}自定义路径间隔必须大于 0（当前: {step}）")
+                if mode == "RAMP":
+                    if rate is None or not np.isfinite(float(rate)) or float(rate) <= 0:
+                        raise RuntimeError(f"{name}自定义路径 Ramp 速率必须大于 0")
                 if targets and abs(targets[-1]["value"] - start) > eps:
                     raise RuntimeError(
                         f"{name}自定义路径不连续：上一段终点 {targets[-1]['value']:.6g}，"
@@ -1867,10 +1981,14 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
                 direction = 1 if end >= start else -1
                 cur = start
+                guard = 0
                 while (direction > 0 and cur <= end + eps) or (direction < 0 and cur >= end - eps):
                     if not targets or abs(targets[-1]["value"] - cur) > eps:
                         targets.append({"value": round(cur, 6), "rate": rate, "mode": mode})
                     cur += direction * step
+                    guard += 1
+                    if guard > 20000:
+                        raise RuntimeError(f"{name}自定义路径阶段数量异常，请检查间隔")
                 if not targets or abs(targets[-1]["value"] - end) > eps:
                     targets.append({"value": end, "rate": rate, "mode": mode})
             return targets
