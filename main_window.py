@@ -552,6 +552,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.detect_thread = None
         self._ui_init_done = False
         self.stop_requested = threading.Event()
+        self.pause_requested = threading.Event()
+        self.task_running = False
         self.sensor_log_file_path = None
         self.status_log_file_path = None
         self.data_log_enabled = False
@@ -590,7 +592,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         self.browse_btn.clicked.connect(self.choose_path)
         self.init_btn.clicked.connect(self.initialize_system)
-        self.start_btn.clicked.connect(self.do_save)
+        self.start_btn.setCheckable(False)
+        self.start_btn.clicked.connect(self.on_run_pause_clicked)
         self.stop_btn.clicked.connect(self.request_task_stop)
         self.avg_checkbox.toggled.connect(self.on_avg_toggled)
         self.single_mode_btn.toggled.connect(self.on_capture_mode_toggled)
@@ -1462,6 +1465,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
         start = time.time()
         last_log_sec = -1
         while True:
+            paused_s = self._wait_while_paused()
+            if paused_s:
+                start += paused_s
             if self.stop_requested.is_set():
                 raise TaskStoppedError("用户已停止任务")
             elapsed = int(time.time() - start)
@@ -1749,9 +1755,60 @@ class MainWindow(LaserLifetimeCalibrationUI):
             except Exception:
                 pass
 
-    def run_capture_once(self, scope, cycle_idx: int, total_cycles: int):
+    def _set_run_button_state(self, text: str):
+        self.start_btn.blockSignals(True)
+        try:
+            self.start_btn.setChecked(False)
+            self.start_btn.setText(text)
+        finally:
+            self.start_btn.blockSignals(False)
+
+    def on_run_pause_clicked(self):
+        if not self.task_running:
+            self.do_save()
+            return
+        if self.stop_requested.is_set():
+            self.append_status("[任务] 正在停止，请等待当前步骤结束")
+            return
+
+        if self.pause_requested.is_set():
+            self.pause_requested.clear()
+            self._set_run_button_state("暂停")
+            self.append_status("[任务] 已继续")
+        else:
+            self.pause_requested.set()
+            self._set_run_button_state("继续")
+            self.append_status("[任务] 已请求暂停，正在等待当前安全点...")
+
+    def _wait_while_paused(self):
+        paused_at = None
+        while self.pause_requested.is_set():
+            if self.stop_requested.is_set():
+                self.pause_requested.clear()
+                raise TaskStoppedError("用户已停止任务")
+            if paused_at is None:
+                paused_at = time.time()
+                self.append_status("[任务] 已暂停")
+            QApplication.processEvents()
+            time.sleep(0.1)
+        if paused_at is None:
+            return 0.0
+        return time.time() - paused_at
+
+    def _check_task_control(self):
         if self.stop_requested.is_set():
             raise TaskStoppedError("用户已停止任务")
+        self._wait_while_paused()
+        if self.stop_requested.is_set():
+            raise TaskStoppedError("用户已停止任务")
+
+    def _finish_task_ui(self):
+        self.task_running = False
+        self.pause_requested.clear()
+        self._set_run_button_state("RUN")
+
+    def run_capture_once(self, scope, cycle_idx: int, total_cycles: int):
+        self._check_task_control()
         capture_mode = self.get_capture_mode()
         _w(scope, "ACQ:STOPAFTER RUNST")
         _w(scope, "ACQ:STATE RUN")
@@ -1767,6 +1824,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         deadline = time.time() + 30.0
         while time.time() < deadline:
+            paused_s = self._wait_while_paused()
+            if paused_s:
+                deadline += paused_s
             if self.stop_requested.is_set():
                 raise TaskStoppedError("用户已停止任务")
             acq = self.query_acquire_status(scope)
@@ -2211,8 +2271,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         capture_mode = self.get_capture_mode()
         saved_files = []
         for n in range(cycles):
-            if self.stop_requested.is_set():
-                raise TaskStoppedError("用户已停止任务")
+            self._check_task_control()
             cycle_no = n + 1
             if capture_mode == "SINGLE":
                 self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] RUN -> SINGLE")
@@ -2233,8 +2292,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             )
 
             for ch in sorted(self.selected_channels):
-                if self.stop_requested.is_set():
-                    raise TaskStoppedError("用户已停止任务")
+                self._check_task_control()
                 t, v, meta = read_waveform(scope, ch)
                 if base_time is None:
                     base_time = t
@@ -2257,7 +2315,12 @@ class MainWindow(LaserLifetimeCalibrationUI):
         return saved_files, start_idx + cycles
 
     def request_task_stop(self):
+        if not self.task_running:
+            self._set_run_button_state("RUN")
+            return
         self.stop_requested.set()
+        self.pause_requested.clear()
+        self._set_run_button_state("RUN")
         self.append_status("[任务] 已请求停止，正在安全结束当前步骤...")
         self._stop_hotplate_and_live_plot("手动停止")
         try:
@@ -2291,34 +2354,37 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.sim_pf_target = self.sim_pf_current
 
     def do_save(self):
-        if not self.start_btn.isChecked():
+        if self.task_running:
             return
+        self.task_running = True
         self.stop_requested.clear()
+        self.pause_requested.clear()
+        self._set_run_button_state("暂停")
         save_dir = self.save_path_edit.text().strip()
         if save_dir and not os.path.isdir(save_dir):
             try:
                 os.makedirs(save_dir, exist_ok=True)
             except Exception:
                 QMessageBox.warning(self, "提示", "保存路径无效，请重新选择")
-                self.start_btn.setChecked(False)
+                self._finish_task_ui()
                 return
 
         if not save_dir:
             QMessageBox.warning(self, "提示", "请先选择保存路径")
-            self.start_btn.setChecked(False)
+            self._finish_task_ui()
             return
         if not self._validate_auto_ramp_rates():
-            self.start_btn.setChecked(False)
+            self._finish_task_ui()
             return
 
         scope_ok, hot_ok, _ = self._auto_initialize_for_start()
         if not scope_ok:
             QMessageBox.warning(self, "提示", "示波器未连接，无法开始")
-            self.start_btn.setChecked(False)
+            self._finish_task_ui()
             return
         if (self.temp_cal_btn.isChecked() or self.press_cal_btn.isChecked()) and not hot_ok:
             QMessageBox.warning(self, "提示", "标定台未连接，无法开始")
-            self.start_btn.setChecked(False)
+            self._finish_task_ui()
             return
 
         try:
@@ -2342,8 +2408,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             saved_files = []
             stage_total = len(stages)
             for i, stage in enumerate(stages, start=1):
-                if self.stop_requested.is_set():
-                    raise TaskStoppedError("用户已停止任务")
+                self._check_task_control()
                 t_txt = "保持当前" if stage["temp"] is None else f"{stage['temp']:.2f}℃"
                 if stage.get("temp_rate") is not None:
                     t_txt += f" @ {float(stage['temp_rate']):.2f}℃/min"
@@ -2455,7 +2520,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self._set_siggen_output(False)
             except Exception:
                 pass
-            self.start_btn.setChecked(False)
+            self._finish_task_ui()
             self.data_log_enabled = False
             self.sensor_log_file_path = None
             self.status_log_file_path = None
@@ -2641,6 +2706,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.append_status(f"[稳定等待] 启动: {', '.join(parts)}")
 
         while True:
+            paused_s = self._wait_while_paused()
+            if paused_s:
+                if temp_since is not None:
+                    temp_since += paused_s
+                if press_since is not None:
+                    press_since += paused_s
+                last_log_ts += paused_s
             if self.stop_requested.is_set():
                 raise TaskStoppedError("用户已停止任务")
             rt_resp, _ = self._query_hotplate("TEMPerature:RTINformation?")
