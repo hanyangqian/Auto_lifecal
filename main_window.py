@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import os
 import re
 import sys
@@ -44,6 +44,7 @@ from laser_lifetime_calibration_ui import LaserLifetimeCalibrationUI
 SERIAL_LOCK = "C030795"
 DEFAULT_TIMEOUT_MS = 20000
 CURVE_TIMEOUT_MS = 12000
+MDO34_CURVE_TIMEOUT_MS = 120000
 SCREENSHOT_TIMEOUT_MS = 20000
 DISCOVERY_TIMEOUT_MS = 1500
 SCOPE_RECOVERY_CLEAR_TIMEOUT_MS = 1000
@@ -58,6 +59,91 @@ MAX_RAMP_RATE = 20.0
 SERIAL_PROBE_TIMEOUT_S = 0.1
 PRESS_CONTROL_SLAVE = 2
 FNAME_RE = re.compile(r"^T(\d+)(?:[_-]?(CH[1-4](?:CH[1-4])*))?\.CSV$", re.IGNORECASE)
+
+
+class ScopeProfile:
+    def __init__(
+        self,
+        name: str,
+        idn_keywords,
+        stopafter_run_cmd: str = "ACQ:STOPAFTER RUNST",
+        stopafter_single_cmd: str = "ACQ:STOPAFTER SEQ",
+        acq_run_cmd: str = "ACQ:STATE RUN",
+        acq_stop_cmd: str = "ACQ:STATE STOP",
+        acquire_mode_query: str = "ACQ:MODE?",
+        acquire_state_query: str = "ACQ:STATE?",
+        acquire_numavg_query: str = "ACQ:NUMAVG?",
+        acquire_numacq_query: str = "ACQ:NUMACQ?",
+        acquire_stopafter_query: str = "ACQ:STOPAFTER?",
+        trigger_state_query: str = "TRIG:STATE?",
+        acquire_mode_set_cmd: str = "ACQ:MODE {mode}",
+        acquire_numavg_set_cmd: str = "ACQ:NUMAVG {numavg}",
+    ):
+        self.name = name
+        self.idn_keywords = [str(x).upper() for x in idn_keywords]
+        self.stopafter_run_cmd = stopafter_run_cmd
+        self.stopafter_single_cmd = stopafter_single_cmd
+        self.acq_run_cmd = acq_run_cmd
+        self.acq_stop_cmd = acq_stop_cmd
+        self.acquire_mode_query = acquire_mode_query
+        self.acquire_state_query = acquire_state_query
+        self.acquire_numavg_query = acquire_numavg_query
+        self.acquire_numacq_query = acquire_numacq_query
+        self.acquire_stopafter_query = acquire_stopafter_query
+        self.trigger_state_query = trigger_state_query
+        self.acquire_mode_set_cmd = acquire_mode_set_cmd
+        self.acquire_numavg_set_cmd = acquire_numavg_set_cmd
+
+
+PROFILE_DPO2024B = ScopeProfile("DPO2024B", ["DPO2024B"])
+PROFILE_MDO34 = ScopeProfile("MDO34", ["MDO34"])
+SUPPORTED_SCOPE_PROFILES = [PROFILE_DPO2024B, PROFILE_MDO34]
+
+
+def profile_from_idn(idn: str) -> ScopeProfile:
+    idn_upper = str(idn).upper()
+    for profile in SUPPORTED_SCOPE_PROFILES:
+        if any(keyword in idn_upper for keyword in profile.idn_keywords):
+            return profile
+    raise RuntimeError(
+        "未识别到支持的示波器型号，已停止操作以避免错误 SCPI 阻塞通信。\n\n"
+        f"IDN: {idn}\n\n"
+        "当前仅支持 DPO2024B 和 MDO34。"
+    )
+
+
+def extract_last_value(resp: str) -> str:
+    text = str(resp).strip()
+    if " " in text:
+        return text.split()[-1]
+    return text
+
+
+def normalize_acq_mode(resp: str) -> str:
+    text = extract_last_value(resp).upper()
+    if text in ("AVE", "AVER", "AVERAGE"):
+        return "AVERAGE"
+    if text in ("SAM", "SAMPLE"):
+        return "SAMPLE"
+    return text
+
+
+def normalize_acq_state(resp: str) -> str:
+    text = extract_last_value(resp).upper()
+    if text in ("1", "ON", "RUN", "RUNNING"):
+        return "1"
+    if text in ("0", "OFF", "STOP", "STOPPED"):
+        return "0"
+    return text
+
+
+def normalize_stopafter(resp: str) -> str:
+    text = extract_last_value(resp).upper()
+    if text in ("RUNSTOP", "RUNST", "RUN/STOP"):
+        return "RUNST"
+    if text in ("SEQ", "SEQUENCE", "SINGLE"):
+        return "SEQ"
+    return text
 
 
 class TaskStoppedError(Exception):
@@ -150,58 +236,77 @@ def _probe_scope_identity(rm, resource: str):
                 pass
 
 
-def discover_scope_resource_robust(serial_lock: str):
+def discover_scope_resource_robust(serial_lock: str, cached_resource: str = ""):
     rm = pyvisa.ResourceManager()
     try:
         resources = list(rm.list_resources())
         if not resources:
             raise RuntimeError("未发现任何 VISA 资源，请确认示波器已连接并安装 NI-VISA。")
 
-        def sort_key(resource: str):
-            upper = resource.upper()
-            return (
-                0 if serial_lock and serial_lock.upper() in upper else 1,
-                0 if "0X0699" in upper or "TEK" in upper else 1,
-                _resource_priority(resource),
-                resource,
-            )
+        usb_resources = [
+            r for r in resources
+            if r.upper().startswith("USB") and "::INSTR" in r.upper()
+        ]
+        if not usb_resources:
+            raise RuntimeError("未发现 USB VISA 资源。当前可见资源：\n" + "\n".join(resources))
+
+        search_order = []
+        if cached_resource and cached_resource in usb_resources:
+            search_order.append(cached_resource)
+        if serial_lock:
+            for r in usb_resources:
+                if serial_lock.upper() in r.upper() and r not in search_order:
+                    search_order.append(r)
+        tek_usb = [r for r in usb_resources if "0X0699" in r.upper() or "0699" in r.upper()]
+        for r in tek_usb + usb_resources:
+            if r not in search_order:
+                search_order.append(r)
 
         matches = []
         probe_errors = []
-        for resource in sorted(resources, key=sort_key):
-            upper = resource.upper()
-            if "::INSTR" not in upper:
-                continue
+        for resource in search_order:
+            scope = None
             try:
-                info = _probe_scope_identity(rm, resource)
+                scope = rm.open_resource(resource)
+                scope.timeout = DISCOVERY_TIMEOUT_MS
+                scope.read_termination = "\n"
+                scope.write_termination = "\n"
+                idn = scope.query("*IDN?").strip()
+                maker, model, serial, firmware = _parse_idn(idn)
+                profile = profile_from_idn(idn)
+                info = {
+                    "resource": resource,
+                    "idn": idn,
+                    "maker": maker,
+                    "model": model,
+                    "serial": serial,
+                    "firmware": firmware,
+                    "profile": profile,
+                }
+                if serial_lock and serial.upper() == serial_lock.upper():
+                    return info
+                matches.append(info)
             except Exception as ex:
                 probe_errors.append(f"{resource} -> {ex}")
-                continue
-
-            maker_upper = info["maker"].upper()
-            idn_upper = info["idn"].upper()
-            serial_upper = info["serial"].upper()
-            is_tek = "TEKTRONIX" in maker_upper or "TEKTRONIX" in idn_upper
-            if not is_tek:
-                continue
-
-            matches.append(info)
-            if serial_lock and serial_upper == serial_lock.upper():
-                return info
+            finally:
+                if scope is not None:
+                    try:
+                        scope.close()
+                    except Exception:
+                        pass
 
         if len(matches) == 1:
             return matches[0]
-
         if len(matches) > 1:
             options = "\n".join(f"{item['resource']} -> {item['idn']}" for item in matches)
-            raise RuntimeError(
-                f"发现多个 Tek 设备，但没有找到序列号 {serial_lock} 的目标设备：\n{options}"
-            )
+            raise RuntimeError(f"发现多个支持的 Tek USB 示波器，但无法自动决定目标：\n{options}")
 
-        resource_list = "\n".join(resources)
-        error_text = "\n".join(probe_errors[:8]) if probe_errors else "(无可用探测结果)"
+        error_text = "\n".join(probe_errors[:12]) if probe_errors else "(无可用探测结果)"
         raise RuntimeError(
-            f"未找到可用 Tek 示波器。当前 VISA 资源：\n{resource_list}\n\n探测结果：\n{error_text}"
+            "未找到支持的 Tek 示波器。当前 USB 资源：\n"
+            + "\n".join(usb_resources)
+            + "\n\n探测结果：\n"
+            + error_text
         )
     finally:
         rm.close()
@@ -213,7 +318,8 @@ def open_scope(resource_str: str):
     scope.timeout = DEFAULT_TIMEOUT_MS
     scope.read_termination = "\n"
     scope.write_termination = "\n"
-    idn = scope.query("*IDN?")
+    idn = scope.query("*IDN?").strip()
+    scope.profile = profile_from_idn(idn)
     return rm, scope, idn
 
 
@@ -310,11 +416,19 @@ def _w(scope, cmd: str, retry=3, sleep_s=0.12):
             time.sleep(sleep_s)
 
 
-def _get_record_length(scope) -> int:
+def _get_record_length_dpo2024b(scope) -> int:
     try:
         return int(float(_q(scope, "WFMOUTPRE:RECORDLENGTH?")))
     except Exception:
         return int(float(_q(scope, "HORIZONTAL:RECORDLENGTH?")))
+
+
+def _get_record_length_mdo34(scope) -> int:
+    return int(float(extract_last_value(_q(scope, "HORIZONTAL:RECORDLENGTH?"))))
+
+
+def _get_transfer_points_mdo34(scope) -> int:
+    return int(float(extract_last_value(_q(scope, "WFMOUTPRE:NR_PT?"))))
 
 
 @contextmanager
@@ -342,20 +456,26 @@ def binary_transfer_mode(scope, chunk_size=1024 * 1024):
             scope.chunk_size = old_chunk
 
 
-def _select_composition_and_width(scope):
+def _select_composition_and_width_dpo2024b(scope):
     comp = _q(scope, "DATA:COMPOSITION:AVAILABLE?").strip().upper()
-
     if "SINGULAR_YT" in comp:
         _w(scope, "DATA:COMPOSITION SINGULAR_YT")
         _w(scope, "DATA:WIDTH 2")
         return 2, "H", "SINGULAR_YT"
-
     _w(scope, "DATA:COMPOSITION COMPOSITE_YT")
     _w(scope, "DATA:WIDTH 1")
     return 1, "B", "COMPOSITE_YT"
 
 
 def read_waveform(scope, ch_name: str):
+    if scope.profile.name == "DPO2024B":
+        return read_waveform_dpo2024b(scope, ch_name)
+    if scope.profile.name == "MDO34":
+        return read_waveform_mdo34(scope, ch_name)
+    raise RuntimeError(f"不支持的示波器型号：{scope.profile.name}")
+
+
+def read_waveform_dpo2024b(scope, ch_name: str):
     _w(scope, f"DATA:SOURCE {ch_name}")
     time.sleep(0.12)
 
@@ -365,8 +485,7 @@ def read_waveform(scope, ch_name: str):
     except Exception:
         pass
 
-    width, dtype, comp_used = _select_composition_and_width(scope)
-
+    width, dtype, comp_used = _select_composition_and_width_dpo2024b(scope)
     preamble = "WFMOUTPRE"
     ymult = float(_q(scope, f"{preamble}:YMULT?"))
     yzero = float(_q(scope, f"{preamble}:YZERO?"))
@@ -379,7 +498,7 @@ def read_waveform(scope, ch_name: str):
     bn_fmt = _q(scope, f"{preamble}:BN_FMT?").strip()
     byt_or = _q(scope, f"{preamble}:BYT_OR?").strip().upper()
 
-    recl = _get_record_length(scope)
+    recl = _get_record_length_dpo2024b(scope)
     _w(scope, "DATA:START 1")
     _w(scope, f"DATA:STOP {recl}")
 
@@ -404,19 +523,12 @@ def read_waveform(scope, ch_name: str):
             transfer_error = ex
             try:
                 scope.clear()
-            except Exception:
-                pass
-            try:
                 scope.write("*CLS")
-            except Exception:
-                pass
-            try:
                 drain_input_buffer(scope, timeout_ms=80)
             except Exception:
                 pass
             if attempt < 2:
                 time.sleep(0.18)
-                continue
 
     if transfer_error is not None or raw is None:
         raise RuntimeError(f"{ch_name} 波形读取失败（CURVE传输超时/中断）: {transfer_error}")
@@ -428,15 +540,103 @@ def read_waveform(scope, ch_name: str):
 
     if len(raw) != recl:
         recl = len(raw)
-
     v = (raw - yoff) * ymult + yzero
     t = xzero + np.arange(recl) * xincr
-
     return t, v, {
+        "scope": "DPO2024B",
         "width": width,
         "dtype": dtype,
         "composition": comp_used,
         "recl": recl,
+        "data_enc": data_enc,
+        "byt_nr": byt_nr,
+        "bn_fmt": bn_fmt,
+        "byt_or": byt_or,
+        "ymult": ymult,
+        "yoff": yoff,
+        "yzero": yzero,
+        "xincr": xincr,
+        "xzero": xzero,
+    }
+
+
+def read_waveform_mdo34(scope, ch_name: str):
+    # MDO34 fixed full-record path. Do not send DATA:COMPOSITION here.
+    _w(scope, f"DATA:SOURCE {ch_name}")
+    time.sleep(0.08)
+
+    record_length = _get_record_length_mdo34(scope)
+    _w(scope, "DATA:START 1")
+    _w(scope, f"DATA:STOP {record_length}")
+
+    # Validated MDO34 command chain.
+    _w(scope, "WFMOUTPRE:ENCDG BINARY")
+    _w(scope, "WFMOUTPRE:BYT_NR 1")
+    _w(scope, "WFMOUTPRE:BN_FMT RI")
+    _w(scope, "WFMOUTPRE:BYT_OR MSB")
+
+    preamble = "WFMOUTPRE"
+    recl = _get_transfer_points_mdo34(scope)
+
+    ymult = float(extract_last_value(_q(scope, f"{preamble}:YMULT?")))
+    yzero = float(extract_last_value(_q(scope, f"{preamble}:YZERO?")))
+    yoff = float(extract_last_value(_q(scope, f"{preamble}:YOFF?")))
+    xincr = float(extract_last_value(_q(scope, f"{preamble}:XINCR?")))
+    xzero = float(extract_last_value(_q(scope, f"{preamble}:XZERO?")))
+
+    data_enc = _q(scope, "WFMOUTPRE:ENCDG?").strip()
+    byt_nr = _q(scope, f"{preamble}:BYT_NR?").strip()
+    bn_fmt = _q(scope, f"{preamble}:BN_FMT?").strip()
+    byt_or = _q(scope, f"{preamble}:BYT_OR?").strip().upper()
+
+    raw = None
+    transfer_error = None
+    for attempt in range(1, 3):
+        try:
+            with temporary_timeout(scope, MDO34_CURVE_TIMEOUT_MS):
+                with binary_transfer_mode(scope):
+                    raw = scope.query_binary_values(
+                        "CURVE?",
+                        datatype="b",
+                        container=np.array,
+                        is_big_endian=True,
+                        expect_termination=True,
+                        chunk_size=1024 * 1024,
+                    )
+            transfer_error = None
+            break
+        except Exception as ex:
+            transfer_error = ex
+            try:
+                scope.clear()
+                scope.write("*CLS")
+                drain_input_buffer(scope, timeout_ms=80)
+            except Exception:
+                pass
+            if attempt < 2:
+                time.sleep(0.18)
+
+    if transfer_error is not None or raw is None:
+        raise RuntimeError(f"{ch_name} 波形读取失败（MDO34 CURVE传输超时/中断）: {transfer_error}")
+
+    try:
+        drain_input_buffer(scope, timeout_ms=80)
+    except Exception:
+        pass
+
+    if len(raw) != recl:
+        recl = len(raw)
+
+    v = yzero + ymult * raw
+    t = xzero + np.arange(recl) * xincr
+
+    return t, v, {
+        "scope": "MDO34",
+        "width": 1,
+        "dtype": "b",
+        "composition": "N/A",
+        "recl": recl,
+        "record_length": record_length,
         "data_enc": data_enc,
         "byt_nr": byt_nr,
         "bn_fmt": bn_fmt,
@@ -516,6 +716,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.selected_channels = {"CH2"}
         self.resource_str = None
         self.idn = None
+        self.profile_name = None
         self.allowed_avg_counts = [2, 4, 8, 16, 32, 64, 128, 256, 512]
         self.control_slave = 1
         self.press_control_slave = PRESS_CONTROL_SLAVE
@@ -1701,34 +1902,30 @@ class MainWindow(LaserLifetimeCalibrationUI):
         return text
 
     def query_acquire_status(self, scope) -> dict:
-        mode = self._extract_value(_q(scope, "ACQ:MODE?")).upper()
-        state = self._extract_value(_q(scope, "ACQ:STATE?"))
-        numavg = int(float(self._extract_value(_q(scope, "ACQ:NUMAVG?"))))
-        numacq = int(float(self._extract_value(_q(scope, "ACQ:NUMACQ?"))))
-        stopafter = self._extract_value(_q(scope, "ACQ:STOPAFTER?")).upper()
-        trig_state = self._extract_value(_q(scope, "TRIG:STATE?")).upper()
+        profile = scope.profile
         return {
-            "mode": mode,
-            "state": state,
-            "numavg": numavg,
-            "numacq": numacq,
-            "stopafter": stopafter,
-            "trig_state": trig_state,
+            "mode": normalize_acq_mode(_q(scope, profile.acquire_mode_query)),
+            "state": normalize_acq_state(_q(scope, profile.acquire_state_query)),
+            "numavg": int(float(extract_last_value(_q(scope, profile.acquire_numavg_query)))),
+            "numacq": int(float(extract_last_value(_q(scope, profile.acquire_numacq_query)))),
+            "stopafter": normalize_stopafter(_q(scope, profile.acquire_stopafter_query)),
+            "trig_state": extract_last_value(_q(scope, profile.trigger_state_query)).upper(),
         }
 
     def apply_acquire_settings(self, scope):
         avg_enabled = self.avg_checkbox.isChecked()
         numavg = self.get_avg_count()
         capture_mode = self.get_capture_mode()
+        profile = scope.profile
 
-        _w(scope, "ACQ:STOPAFTER RUNST")
+        _w(scope, profile.stopafter_run_cmd)
         if avg_enabled:
-            _w(scope, "ACQ:MODE AVERAGE")
-            _w(scope, f"ACQ:NUMAVG {numavg}")
-            self.append_status(f"[示波器] Acquire模式: AVERAGE, 平均次数: {numavg}")
+            _w(scope, profile.acquire_mode_set_cmd.format(mode="AVERAGE"))
+            _w(scope, profile.acquire_numavg_set_cmd.format(numavg=numavg))
+            self.append_status(f"[示波器] {profile.name} Acquire模式: AVERAGE, 平均次数: {numavg}")
         else:
-            _w(scope, "ACQ:MODE SAMPLE")
-            self.append_status("[示波器] Acquire模式: SAMPLE")
+            _w(scope, profile.acquire_mode_set_cmd.format(mode="SAMPLE"))
+            self.append_status(f"[示波器] {profile.name} Acquire模式: SAMPLE")
         self.append_status(f"[示波器] 采样模式: {capture_mode}")
 
     def apply_scope_settings_now(self, reason: str = "手动设置") -> bool:
@@ -1810,8 +2007,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
     def run_capture_once(self, scope, cycle_idx: int, total_cycles: int):
         self._check_task_control()
         capture_mode = self.get_capture_mode()
-        _w(scope, "ACQ:STOPAFTER RUNST")
-        _w(scope, "ACQ:STATE RUN")
+        profile = scope.profile
+        _w(scope, profile.stopafter_run_cmd)
+        _w(scope, profile.acq_run_cmd)
         time.sleep(0.15)
         QApplication.processEvents()
 
@@ -1819,8 +2017,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.append_status(f"[循环 {cycle_idx}/{total_cycles}] 连续采样运行")
             return
 
-        _w(scope, "ACQ:STOPAFTER SEQ")
-        _w(scope, "ACQ:STATE RUN")
+        _w(scope, profile.stopafter_single_cmd)
+        _w(scope, profile.acq_run_cmd)
 
         deadline = time.time() + 30.0
         while time.time() < deadline:
@@ -1848,7 +2046,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         try:
             if scope:
                 try:
-                    _w(scope, "ACQ:STATE STOP", retry=1, sleep_s=0.02)
+                    _w(scope, scope.profile.acq_stop_cmd, retry=1, sleep_s=0.02)
                 except Exception:
                     pass
                 clear_session(scope)
@@ -1873,6 +2071,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         self.resource_str = None
         self.idn = None
+        self.profile_name = None
         QApplication.processEvents()
         time.sleep(min(0.6 * attempt, 2.5))
         self.try_lock_scope(show_error=False, verbose=False)
@@ -1920,19 +2119,25 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def try_lock_scope(self, show_error=True, verbose=True):
         try:
-            device_info = discover_scope_resource_robust(SERIAL_LOCK)
+            cached_resource = self.settings.value("scope_resource_str", "", type=str)
+            device_info = discover_scope_resource_robust(SERIAL_LOCK, cached_resource=cached_resource)
             self.resource_str = device_info["resource"]
             self.idn = device_info["idn"].strip()
+            self.profile_name = device_info["profile"].name
+            self.settings.setValue("scope_resource_str", self.resource_str)
             if verbose:
                 self.append_status(f"[示波器] 已锁定 [{SERIAL_LOCK}]")
+                self.append_status(f"[示波器] 型号: {self.profile_name}")
                 self.append_status(f"[示波器] 资源: {self.resource_str}")
                 self.append_status(f"[示波器] IDN: {self.idn}")
             parts = [x.strip() for x in self.idn.split(",")]
             sn = parts[2] if len(parts) > 2 and parts[2] else self.idn
             return True, sn
         except Exception as e:
+            self.settings.remove("scope_resource_str")
             self.resource_str = None
             self.idn = None
+            self.profile_name = None
             if verbose:
                 self.append_status(f"[示波器] 未连接或锁定失败: {e}")
             if show_error:
@@ -2278,7 +2483,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             else:
                 self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] RUN")
             self.run_capture_once(scope, cycle_no, cycles)
-            _w(scope, "ACQ:STATE STOP")
+            _w(scope, scope.profile.acq_stop_cmd)
             time.sleep(0.25)
 
             csv_data = {}
@@ -2303,8 +2508,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
                 csv_data[ch] = v
                 self.append_status(
-                    f"[阶段{stage_idx}][循环{cycle_no}][{ch}] {meta['composition']} width={meta['width']} dtype={meta['dtype']} "
-                    f"BYT_OR={meta['byt_or']} BN_FMT={meta['bn_fmt']} ENC={meta['data_enc']}"
+                    f"[阶段{stage_idx}][循环{cycle_no}][{ch}] scope={meta['scope']} {meta['composition']} "
+                    f"width={meta['width']} dtype={meta['dtype']} BYT_OR={meta['byt_or']} "
+                    f"BN_FMT={meta['bn_fmt']} ENC={meta['data_enc']} N={meta['recl']}"
                 )
                 QApplication.processEvents()
 
