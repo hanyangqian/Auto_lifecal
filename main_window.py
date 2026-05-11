@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import os
 import re
 import sys
@@ -728,6 +728,19 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.hotplate_guard_timer = QTimer(self)
         self.hotplate_guard_timer.setInterval(1200)
         self.hotplate_guard_timer.timeout.connect(self.check_hotplate_ramp_guard)
+
+        # 压力 RAMP 独立守护。温度原来有提前 STOP 监控，压力这里补齐同级逻辑。
+        # 不设置重发次数上限：如果设备偶发 STOP 且压力未达标，会按冷却间隔持续补发 RAMP。
+        self.press_ramp_target = None
+        self.press_ramp_rate_kpm = None
+        self.press_reach_inband_since = None
+        self.press_reach_confirmed = False
+        self.last_hotplate_press_s_status = None
+        self.press_guard_last_restart_ts = 0.0
+        self.hotplate_press_guard_timer = QTimer(self)
+        self.hotplate_press_guard_timer.setInterval(1200)
+        self.hotplate_press_guard_timer.timeout.connect(self.check_hotplate_press_ramp_guard)
+
         self.hotplate_live_timer = QTimer(self)
         self.hotplate_live_timer.setInterval(1000)
         self.hotplate_live_timer.timeout.connect(self.poll_hotplate_live_data)
@@ -2453,11 +2466,18 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         f"TEMPerature:RAMP {press_target},{rate}",
                     ]
                 )
+                self.press_ramp_target = press_target
+                self.press_ramp_rate_kpm = rate
+                self.press_reach_inband_since = None
+                self.press_reach_confirmed = False
+                self.last_hotplate_press_s_status = None
+                self.press_guard_last_restart_ts = 0.0
                 base_pk = self.last_live_pk if self.last_live_pk is not None else self.sim_pf_current
                 self.sim_pf_target = press_target
                 self.sim_pf_current = base_pk
                 self.sim_prate_kpm = abs(rate)
                 self.sim_press_mode = "ramp"
+                self.hotplate_press_guard_timer.start()
                 self.append_status(f"[阶段] 压力设定: RAMP -> {press_target:.2f} kPa @ {rate:.2f} kPa/min")
             else:
                 self._send_hotplate_commands(
@@ -2470,6 +2490,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self.sim_pf_current = press_target
                 self.sim_prate_kpm = 0.0
                 self.sim_press_mode = "hold"
+                self._reset_press_ramp_guard_state()
                 self.append_status(f"[阶段] 压力设定: HOLD -> {press_target:.2f} kPa")
 
     def _run_scope_cycles_for_stage(self, scope, save_dir: str, start_idx: int, cycles: int, stage_idx: int, stage_total: int):
@@ -2558,6 +2579,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.sim_press_mode = "hold"
         self.sim_prate_kpm = 0.0
         self.sim_pf_target = self.sim_pf_current
+        self._reset_ramp_guard_state()
+        self._reset_press_ramp_guard_state()
 
     def do_save(self):
         if self.task_running:
@@ -2731,6 +2754,23 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.sensor_log_file_path = None
             self.status_log_file_path = None
 
+    def _log_hotplate_send_commands(self, commands, baud=None, prefix="SEND"):
+        """把标定台写命令写入活动日志。实时温压查询不走这个函数，所以不会刷屏。"""
+        try:
+            baud_text = "" if baud is None else f" @{baud}bps"
+            for cmd in commands:
+                self.append_status(f"[标定台命令] {prefix}{baud_text}: {cmd}")
+        except Exception:
+            pass
+
+    def _log_hotplate_diag_query(self, cmd: str, baud=None):
+        """异常诊断/守护查询要显式写入活动日志，便于复盘。"""
+        try:
+            baud_text = "" if baud is None else f" @{baud}bps"
+            self.append_status(f"[标定台命令] DIAG-QUERY{baud_text}: {cmd}")
+        except Exception:
+            pass
+
     def _send_hotplate_commands(self, commands):
         if serial is None:
             raise RuntimeError("未安装 pyserial，请先执行: pip install pyserial")
@@ -2758,6 +2798,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     ser.write((cmd + "\r").encode("ascii"))
                     ser.flush()
                     time.sleep(0.05)
+                self._log_hotplate_send_commands(commands, baud=baud)
                 return baud
             except Exception as ex:
                 errors.append(f"{baud}bps -> {ex}")
@@ -2869,6 +2910,46 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 pass
 
         return tc1, pk2, tf1, tt1, s_status, err_code
+
+    @staticmethod
+    def _extract_slave_rt_fields(resp: str, slave: int):
+        """解析 RTINformation 中指定 slave 的当前值、目标值、剩余/时间、状态和错误码。"""
+        if not resp:
+            return None, None, None, None, None
+        frames = re.findall(r"MK:\d+:[^\r\n]*", resp, flags=re.IGNORECASE)
+        for fr in frames:
+            parts = fr.split(":")
+            if len(parts) < 10:
+                continue
+            try:
+                sx = int(float(parts[1]))
+            except Exception:
+                continue
+            if sx != int(slave):
+                continue
+            current = target = tt = s_status = err_code = None
+            try:
+                current = float(parts[2])
+            except Exception:
+                pass
+            try:
+                target = float(parts[4])
+            except Exception:
+                pass
+            try:
+                tt = float(parts[5])
+            except Exception:
+                pass
+            try:
+                s_status = int(float(parts[8]))
+            except Exception:
+                pass
+            try:
+                err_code = int(float(parts[10].split(",")[-1])) if len(parts) > 10 else None
+            except Exception:
+                pass
+            return current, target, tt, s_status, err_code
+        return None, None, None, None, None
 
     @staticmethod
     def _extract_temp_pressure_fallback(resp: str):
@@ -3006,7 +3087,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 f"diff={diff:.3f}, inband={inband_sec:.1f}/{TARGET_HOLD_S:.0f}s, tf={tf_rt}, tt={tt_rt}, err={err_code}"
             )
 
-    def _diagnose_hotplate_unexpected_stop(self):
+    def _diagnose_hotplate_unexpected_stop(self, axis: str = "温度"):
         commands = [
             "TEMPerature:STATus?",
             "TEMPerature:ERRor?",
@@ -3018,11 +3099,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
         fields = []
         for cmd in commands:
             try:
+                self._log_hotplate_diag_query(cmd)
                 resp, baud = self._query_hotplate(cmd)
+                self._log_hotplate_diag_query(cmd, baud=baud)
                 fields.append(f"{cmd}@{baud}bps={resp!r}")
             except Exception as ex:
                 fields.append(f"{cmd}=<ERR:{ex}>")
-        self.append_status("[标定台] DIAG stop snapshot: " + "; ".join(fields))
+        self.append_status(f"[标定台] DIAG stop snapshot ({axis}): " + "; ".join(fields))
 
     def check_hotplate_ramp_guard(self):
         if self.ramp_target_temp is None:
@@ -3047,7 +3130,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self.append_status(
                     f"[标定台] 警告: RAMP在未达标时提前停止 [{baud}bps], rt={rt_resp!r}"
                 )
-                self._diagnose_hotplate_unexpected_stop()
+                self._diagnose_hotplate_unexpected_stop(axis="温度")
             self.last_hotplate_s_status = s_status
 
             if self.reach_confirmed and s_status in (0, 1):
@@ -3056,6 +3139,109 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         except Exception as ex:
             self.append_status(f"[标定台] 监控查询失败: {ex}")
+
+    def _reset_press_ramp_guard_state(self):
+        self.press_ramp_target = None
+        self.press_ramp_rate_kpm = None
+        self.press_reach_inband_since = None
+        self.press_reach_confirmed = False
+        self.last_hotplate_press_s_status = None
+        self.press_guard_last_restart_ts = 0.0
+        self.hotplate_press_guard_timer.stop()
+
+    def _update_press_reach_judge(self, pk_now, s_status, pf_rt=None, tt_rt=None, err_code=None):
+        if self.press_ramp_target is None or pk_now is None:
+            return
+
+        target = self.press_ramp_target
+        try:
+            tol = float(self.press_fluc_spin.value())
+        except Exception:
+            tol = max(0.5, abs(target) * 0.001)
+        try:
+            hold_s = float(self.press_stable_time_spin.value())
+        except Exception:
+            hold_s = TARGET_HOLD_S
+
+        diff = abs(pk_now - target)
+        now = time.time()
+
+        if s_status == 2:
+            if diff <= tol:
+                if self.press_reach_inband_since is None:
+                    self.press_reach_inband_since = now
+                inband_sec = now - self.press_reach_inband_since
+            else:
+                self.press_reach_inband_since = None
+                inband_sec = 0.0
+
+            if (not self.press_reach_confirmed) and inband_sec >= hold_s:
+                self.press_reach_confirmed = True
+                self.append_status(
+                    f"[标定台] P-RAMP达标: |PK-PF| <= {tol:.3f} kPa 持续 {hold_s:.0f}s"
+                )
+        elif s_status == 0 and not self.press_reach_confirmed:
+            inband_sec = 0.0 if self.press_reach_inband_since is None else (now - self.press_reach_inband_since)
+            self.append_status(
+                f"[标定台] WARN pressure ramp stopped before reach-confirmed: pk={pk_now:.3f}, "
+                f"target={target:.3f}, diff={diff:.3f}, inband={inband_sec:.1f}/{hold_s:.0f}s, "
+                f"pf={pf_rt}, tt={tt_rt}, err={err_code}"
+            )
+
+    def _restart_hotplate_press_ramp_without_limit(self, reason: str):
+        if self.press_ramp_target is None or self.press_ramp_rate_kpm is None:
+            return
+        now = time.time()
+        # 无次数上限，但加一个短冷却，避免控制台持续 stop 时一秒刷爆串口。
+        if now - self.press_guard_last_restart_ts < 5.0:
+            return
+        self.press_guard_last_restart_ts = now
+        commands = [
+            f"TEMPerature:OPSLave {self.press_control_slave}",
+            f"TEMPerature:RAMP {self.press_ramp_target},{self.press_ramp_rate_kpm}",
+        ]
+        self.append_status(
+            f"[标定台] 压力RAMP异常恢复: {reason}，重新发送 P-RAMP -> "
+            f"{self.press_ramp_target:.3f} kPa @ {self.press_ramp_rate_kpm:.3f} kPa/min（无次数上限）"
+        )
+        self._send_hotplate_commands(commands)
+        self.last_hotplate_press_s_status = None
+        self.sim_pf_target = self.press_ramp_target
+        self.sim_prate_kpm = abs(self.press_ramp_rate_kpm)
+        self.sim_press_mode = "ramp"
+
+    def check_hotplate_press_ramp_guard(self):
+        if self.press_ramp_target is None:
+            self.hotplate_press_guard_timer.stop()
+            return
+        try:
+            rt_resp, baud = self._query_hotplate("TEMPerature:RTINformation?")
+            pk, pf_rt, tt_rt, s_status, err_code = self._extract_slave_rt_fields(rt_resp, self.press_control_slave)
+            if pk is None:
+                _, pk = self._extract_temp_pressure_fallback(rt_resp)
+            self._update_press_reach_judge(pk, s_status, pf_rt=pf_rt, tt_rt=tt_rt, err_code=err_code)
+
+            if s_status != self.last_hotplate_press_s_status:
+                self.append_status(
+                    f"[标定台] P-STATE s_status changed: {self.last_hotplate_press_s_status} -> {s_status} "
+                    "(0-stop,1-hold,2-ramp)"
+                )
+
+            if s_status == 0 and not self.press_reach_confirmed:
+                self.append_status(
+                    f"[标定台] 警告: P-RAMP在未达标时停止/卡住 [{baud}bps], rt={rt_resp!r}"
+                )
+                self._diagnose_hotplate_unexpected_stop(axis="压力")
+                self._restart_hotplate_press_ramp_without_limit("检测到压力通道 STOP 且未达标")
+
+            self.last_hotplate_press_s_status = s_status
+
+            if self.press_reach_confirmed and s_status in (0, 1):
+                self.append_status("[标定台] 压力达标后已进入稳定/停止状态，停止P-RAMP监控")
+                self.hotplate_press_guard_timer.stop()
+
+        except Exception as ex:
+            self.append_status(f"[标定台] 压力监控查询失败: {ex}")
 
     def send_hotplate_hold(self):
         tf = float(self.hotplate_tf_spin.value())
@@ -3141,6 +3327,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.sim_pf_current = pf
             self.sim_prate_kpm = 0.0
             self.sim_press_mode = "hold"
+            self._reset_press_ramp_guard_state()
             self.append_status(f"[标定台] P-HOLD 已发送: PF={pf:.2f} kPa")
         except Exception as ex:
             QMessageBox.critical(self, "压力控制失败", str(ex))
@@ -3165,11 +3352,18 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     f"TEMPerature:RAMP {pf},{prate}",
                 ]
             )
+            self.press_ramp_target = pf
+            self.press_ramp_rate_kpm = prate
+            self.press_reach_inband_since = None
+            self.press_reach_confirmed = False
+            self.last_hotplate_press_s_status = None
+            self.press_guard_last_restart_ts = 0.0
             base_pk = self.last_live_pk if self.last_live_pk is not None else self.sim_pf_current
             self.sim_pf_target = pf
             self.sim_pf_current = base_pk
             self.sim_prate_kpm = abs(prate)
             self.sim_press_mode = "ramp"
+            self.hotplate_press_guard_timer.start()
             self.append_status(f"[标定台] P-RAMP 已发送: PF={pf:.2f} kPa, P-Rate={prate:.2f} kPa/min")
         except Exception as ex:
             QMessageBox.critical(self, "压力控制失败", str(ex))
@@ -3185,6 +3379,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.sim_press_mode = "hold"
             self.sim_prate_kpm = 0.0
             self.sim_pf_target = self.sim_pf_current
+            self._reset_press_ramp_guard_state()
             self.append_status("[标定台] P-STOP 已发送")
         except Exception as ex:
             QMessageBox.critical(self, "压力控制失败", str(ex))
