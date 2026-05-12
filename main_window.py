@@ -2546,8 +2546,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
             stages = []
             order = self._stage_control_order()
             if order == "PRESS_THEN_TEMP":
-                for press in press_targets:
-                    for temp in temp_targets:
+                for press_idx, press in enumerate(press_targets):
+                    for temp_idx, temp in enumerate(temp_targets):
                         stages.append(
                             {
                                 "temp": float(temp["value"]),
@@ -2556,9 +2556,14 @@ class MainWindow(LaserLifetimeCalibrationUI):
                                 "press": float(press["value"]),
                                 "press_rate": press["rate"],
                                 "press_mode": press.get("mode"),
+                                # 压力优先遍历时，压力组切换后需要先把温度拉回本轮温度起点，
+                                # 再切换到新的压力，避免在上一轮高温末点直接改压力。
+                                "pre_temp_before_press": press_idx > 0 and temp_idx == 0,
+                                # 同一压力组内后续温度点不重复发送压力设定，只继续走温度序列。
+                                "press_already_set": temp_idx > 0,
                             }
                         )
-                priority_text = "按压力优先遍历，阶段内先控压后控温"
+                priority_text = "按压力优先遍历；切换压力前先回到温度起点，再控压后循环温度"
             elif order == "TEMP_THEN_PRESS":
                 for temp in temp_targets:
                     for press in press_targets:
@@ -2719,6 +2724,43 @@ class MainWindow(LaserLifetimeCalibrationUI):
         has_press = self.press_cal_btn.isChecked() and stage.get("press") is not None
 
         if has_temp and has_press and order == "PRESS_THEN_TEMP":
+            if stage.get("pre_temp_before_press"):
+                self.append_status("[阶段] 执行顺序: 切换压力前先回到温度起点，温度稳定后再控压")
+                self._apply_stage_setpoints(
+                    stage["temp"],
+                    None,
+                    stage.get("temp_rate"),
+                    None,
+                    stage.get("temp_mode"),
+                    None,
+                )
+                self.wait_for_temp_press_stable(need_temp=True, need_press=False, reason="切换压力前温度先达标")
+                self._apply_stage_setpoints(
+                    None,
+                    stage["press"],
+                    None,
+                    stage.get("press_rate"),
+                    None,
+                    stage.get("press_mode"),
+                )
+                self.wait_for_temp_press_stable(need_temp=False, need_press=True, reason="压力切换后达标")
+                self.wait_for_temp_press_stable(need_temp=True, need_press=True, reason="温压最终确认")
+                return
+
+            if stage.get("press_already_set"):
+                self.append_status("[阶段] 执行顺序: 压力保持当前组，继续控温")
+                self._apply_stage_setpoints(
+                    stage["temp"],
+                    None,
+                    stage.get("temp_rate"),
+                    None,
+                    stage.get("temp_mode"),
+                    None,
+                )
+                self.wait_for_temp_press_stable(need_temp=True, need_press=False, reason="温度达标")
+                self.wait_for_temp_press_stable(need_temp=True, need_press=True, reason="温压最终确认")
+                return
+
             self.append_status("[阶段] 执行顺序: 先控压，压力稳定后再控温")
             self._apply_stage_setpoints(
                 None,
