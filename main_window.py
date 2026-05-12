@@ -32,6 +32,7 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QLabel,
     QHBoxLayout,
+    QWidget,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
@@ -833,6 +834,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.load_saved_path()
         self.load_fit_enable_setting()
         self.load_custom_axis_settings()
+        self._install_stage_control_order_ui()
+        self.load_stage_control_order_setting()
         self.settings_button.hide()
         self._ui_init_done = True
         self.append_status("[系统] 已加载主窗口")
@@ -867,6 +870,186 @@ class MainWindow(LaserLifetimeCalibrationUI):
         edit_btn.setEnabled(checked)
         for control in controls:
             control.setEnabled(not checked)
+
+    def _install_stage_control_order_ui(self):
+        """把温压执行顺序嵌入“标定模式”输入区域，不再挤占流程设置整行。
+
+        设计思路：不要在“标定模式”这一行硬塞一组新的 label+combo 并整体右移，
+        而是把原来的标定模式下拉框与“顺序 温-压/压-温”组合成一个紧凑输入单元。
+        这样光源稳定时间、循环次数仍留在原位置，整行对称性更好。
+        """
+        if hasattr(self, "stage_control_order_combo"):
+            return
+
+        self.stage_control_order_combo = QComboBox(self)
+        self.stage_control_order_combo.addItem("温-压", "TEMP_THEN_PRESS")
+        self.stage_control_order_combo.addItem("压-温", "PRESS_THEN_TEMP")
+        self.stage_control_order_combo.setFixedWidth(62)
+        self.stage_control_order_combo.setToolTip(
+            "温-压：先等待温度稳定，再发送压力目标。\n"
+            "压-温：先等待压力稳定，再发送温度目标。"
+        )
+        self.stage_control_order_combo.currentIndexChanged.connect(self.on_stage_control_order_changed)
+
+        order_label = QLabel("顺序:", self)
+        order_label.setToolTip(self.stage_control_order_combo.toolTip())
+        self.stage_control_order_label = order_label
+
+        def _find_item_at(layout: QGridLayout, row: int, col: int):
+            for idx in range(layout.count()):
+                item = layout.itemAt(idx)
+                if item is None:
+                    continue
+                r, c, rs, cs = layout.getItemPosition(idx)
+                if r == row and c == col:
+                    return idx, item, r, c, rs, cs
+            return None
+
+        def _embed_next_to_calibration_mode() -> bool:
+            for lab in self.findChildren(QLabel):
+                text = lab.text().replace(" ", "")
+                if not text.startswith("标定模式"):
+                    continue
+                parent = lab.parentWidget()
+                layout = parent.layout() if parent is not None else None
+                if not isinstance(layout, QGridLayout):
+                    continue
+
+                label_pos = None
+                for i in range(layout.count()):
+                    item = layout.itemAt(i)
+                    if item is not None and item.widget() is lab:
+                        label_pos = layout.getItemPosition(i)
+                        break
+                if label_pos is None:
+                    continue
+                row, col, _rowspan, _colspan = label_pos
+
+                mode_item_pack = _find_item_at(layout, row, col + 1)
+                if mode_item_pack is None:
+                    continue
+                item_index, item, _r, _c, rowspan, colspan = mode_item_pack
+                mode_widget = item.widget()
+                if mode_widget is None:
+                    continue
+
+                layout.takeAt(item_index)
+                container = QWidget(parent)
+                row_layout = QHBoxLayout(container)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(4)
+                try:
+                    mode_widget.setFixedWidth(92)
+                except Exception:
+                    pass
+                try:
+                    self.stable_time_spin.setFixedWidth(68)
+                    self.cycles_spin.setFixedWidth(58)
+                except Exception:
+                    pass
+                row_layout.addWidget(mode_widget, 0)
+                row_layout.addWidget(order_label, 0)
+                row_layout.addWidget(self.stage_control_order_combo, 0)
+                layout.addWidget(container, row, col + 1, rowspan, colspan)
+                return True
+            return False
+
+        if _embed_next_to_calibration_mode():
+            return
+
+        # 回退：找不到“标定模式”时，放到流程设置区域第一行末尾，不改任何原按钮文字。
+        target_parent = None
+        for name in ("cycles_spin", "stable_time_spin", "start_btn", "stop_btn"):
+            widget = getattr(self, name, None)
+            if widget is not None and widget.parentWidget() is not None and widget.parentWidget().layout() is not None:
+                target_parent = widget.parentWidget()
+                break
+        if target_parent is None:
+            return
+        layout = target_parent.layout()
+        row_layout = QHBoxLayout()
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+        try:
+            self.stable_time_spin.setFixedWidth(68)
+            self.cycles_spin.setFixedWidth(58)
+        except Exception:
+            pass
+        row_layout.addWidget(order_label)
+        row_layout.addWidget(self.stage_control_order_combo)
+        row_layout.addStretch(1)
+        if isinstance(layout, QGridLayout):
+            row = 0
+            col = layout.columnCount()
+            layout.addLayout(row_layout, row, col, 1, 1)
+        else:
+            try:
+                layout.addLayout(row_layout)
+            except Exception:
+                pass
+
+    def load_stage_control_order_setting(self):
+        # 使用新的 key，避免旧版本错误默认值“同步控温控压（原逻辑）”继续残留。
+        order = self.settings.value("stage_control_order_v2", "TEMP_THEN_PRESS", type=str)
+        combo = getattr(self, "stage_control_order_combo", None)
+        if combo is None:
+            return
+        idx = combo.findData(order)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def on_stage_control_order_changed(self):
+        combo = getattr(self, "stage_control_order_combo", None)
+        if combo is None:
+            return
+        order = combo.currentData() or "TEMP_THEN_PRESS"
+        self.settings.setValue("stage_control_order_v2", order)
+        if getattr(self, "_ui_init_done", False):
+            self.append_status(f"[阶段] 温压执行顺序: {combo.currentText()}")
+
+    def _stage_control_order(self) -> str:
+        combo = getattr(self, "stage_control_order_combo", None)
+        if combo is None:
+            return "TEMP_THEN_PRESS"
+        return str(combo.currentData() or "TEMP_THEN_PRESS")
+
+    @staticmethod
+    def _format_condition_value(value, unit: str) -> str:
+        try:
+            return f"{float(value):g}{unit}"
+        except Exception:
+            return f"{value}{unit}"
+
+    def _log_stage_condition_summary(self, temp_targets, press_targets, order: str):
+        temp_values = [item.get("value") for item in temp_targets if item.get("value") is not None]
+        press_values = [item.get("value") for item in press_targets if item.get("value") is not None]
+
+        if temp_values and press_values:
+            groups = []
+            if order == "PRESS_THEN_TEMP":
+                for press in press_values:
+                    parts = [self._format_condition_value(press, "kPa")]
+                    parts.extend(self._format_condition_value(temp, "℃") for temp in temp_values)
+                    groups.append("，".join(parts))
+            else:
+                for temp in temp_values:
+                    parts = [self._format_condition_value(temp, "℃")]
+                    parts.extend(self._format_condition_value(press, "kPa") for press in press_values)
+                    groups.append("，".join(parts))
+            total = len(temp_values) * len(press_values)
+            self.append_status(f"[阶段] 工况列表: {'；'.join(groups)}；总工况数={total}")
+            return
+
+        if temp_values:
+            groups = [self._format_condition_value(temp, "℃") for temp in temp_values]
+            self.append_status(f"[阶段] 工况列表: {'；'.join(groups)}；总工况数={len(temp_values)}")
+            return
+
+        if press_values:
+            groups = [self._format_condition_value(press, "kPa") for press in press_values]
+            self.append_status(f"[阶段] 工况列表: {'；'.join(groups)}；总工况数={len(press_values)}")
+            return
+
+        self.append_status("[阶段] 工况列表: 保持当前温度和压力；总工况数=1")
 
     def on_custom_axis_toggled(self, axis: str, checked: bool):
         self._sync_custom_axis_ui(axis, checked)
@@ -2361,26 +2544,57 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         if need_temp and need_press:
             stages = []
-            for temp in temp_targets:
+            order = self._stage_control_order()
+            if order == "PRESS_THEN_TEMP":
                 for press in press_targets:
-                    stages.append(
-                        {
-                            "temp": float(temp["value"]),
-                            "temp_rate": temp["rate"],
-                            "temp_mode": temp.get("mode"),
-                            "press": float(press["value"]),
-                            "press_rate": press["rate"],
-                            "press_mode": press.get("mode"),
-                        }
-                    )
+                    for temp in temp_targets:
+                        stages.append(
+                            {
+                                "temp": float(temp["value"]),
+                                "temp_rate": temp["rate"],
+                                "temp_mode": temp.get("mode"),
+                                "press": float(press["value"]),
+                                "press_rate": press["rate"],
+                                "press_mode": press.get("mode"),
+                            }
+                        )
+                priority_text = "按压力优先遍历，阶段内先控压后控温"
+            elif order == "TEMP_THEN_PRESS":
+                for temp in temp_targets:
+                    for press in press_targets:
+                        stages.append(
+                            {
+                                "temp": float(temp["value"]),
+                                "temp_rate": temp["rate"],
+                                "temp_mode": temp.get("mode"),
+                                "press": float(press["value"]),
+                                "press_rate": press["rate"],
+                                "press_mode": press.get("mode"),
+                            }
+                        )
+                priority_text = "按温度优先遍历，阶段内先控温后控压（原逻辑）"
+            else:
+                for temp in temp_targets:
+                    for press in press_targets:
+                        stages.append(
+                            {
+                                "temp": float(temp["value"]),
+                                "temp_rate": temp["rate"],
+                                "temp_mode": temp.get("mode"),
+                                "press": float(press["value"]),
+                                "press_rate": press["rate"],
+                                "press_mode": press.get("mode"),
+                            }
+                        )
+                priority_text = "按温度优先遍历，阶段内先控温后控压（原逻辑）"
             self.append_status(
-                f"[阶段] 温度阶段数={len(temp_targets)}，压力阶段数={len(press_targets)}，"
-                f"按温度优先遍历共 {len(stages)} 阶段"
+                f"[阶段] 温度段数={len(temp_targets)}，压力段数={len(press_targets)}，{priority_text}"
             )
+            self._log_stage_condition_summary(temp_targets, press_targets, order)
             return stages
 
         if need_temp:
-            return [
+            stages = [
                 {
                     "temp": float(item["value"]),
                     "temp_rate": item["rate"],
@@ -2391,8 +2605,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 }
                 for item in temp_targets
             ]
+            self._log_stage_condition_summary(temp_targets, [{"value": None, "rate": None}], self._stage_control_order())
+            return stages
         if need_press:
-            return [
+            stages = [
                 {
                     "temp": None,
                     "temp_rate": None,
@@ -2403,6 +2619,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 }
                 for item in press_targets
             ]
+            self._log_stage_condition_summary([{"value": None, "rate": None}], press_targets, self._stage_control_order())
+            return stages
+        self._log_stage_condition_summary([{"value": None, "rate": None}], [{"value": None, "rate": None}], self._stage_control_order())
         return [{"temp": None, "temp_rate": None, "temp_mode": None, "press": None, "press_rate": None, "press_mode": None}]
 
     def _apply_stage_setpoints(
@@ -2492,6 +2711,70 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self.sim_press_mode = "hold"
                 self._reset_press_ramp_guard_state()
                 self.append_status(f"[阶段] 压力设定: HOLD -> {press_target:.2f} kPa")
+
+    def _apply_stage_setpoints_and_wait(self, stage: dict):
+        """按用户选择的温压顺序执行阶段设定，并等待对应通道稳定。"""
+        order = self._stage_control_order()
+        has_temp = self.temp_cal_btn.isChecked() and stage.get("temp") is not None
+        has_press = self.press_cal_btn.isChecked() and stage.get("press") is not None
+
+        if has_temp and has_press and order == "PRESS_THEN_TEMP":
+            self.append_status("[阶段] 执行顺序: 先控压，压力稳定后再控温")
+            self._apply_stage_setpoints(
+                None,
+                stage["press"],
+                None,
+                stage.get("press_rate"),
+                None,
+                stage.get("press_mode"),
+            )
+            self.wait_for_temp_press_stable(need_temp=False, need_press=True, reason="压力先达标")
+            self._apply_stage_setpoints(
+                stage["temp"],
+                None,
+                stage.get("temp_rate"),
+                None,
+                stage.get("temp_mode"),
+                None,
+            )
+            self.wait_for_temp_press_stable(need_temp=True, need_press=False, reason="温度后达标")
+            self.wait_for_temp_press_stable(need_temp=True, need_press=True, reason="温压最终确认")
+            return
+
+        if has_temp and has_press and order == "TEMP_THEN_PRESS":
+            self.append_status("[阶段] 执行顺序: 先控温，温度稳定后再控压")
+            self._apply_stage_setpoints(
+                stage["temp"],
+                None,
+                stage.get("temp_rate"),
+                None,
+                stage.get("temp_mode"),
+                None,
+            )
+            self.wait_for_temp_press_stable(need_temp=True, need_press=False, reason="温度先达标")
+            self._apply_stage_setpoints(
+                None,
+                stage["press"],
+                None,
+                stage.get("press_rate"),
+                None,
+                stage.get("press_mode"),
+            )
+            self.wait_for_temp_press_stable(need_temp=False, need_press=True, reason="压力后达标")
+            self.wait_for_temp_press_stable(need_temp=True, need_press=True, reason="温压最终确认")
+            return
+
+        if has_temp and has_press:
+            self.append_status("[阶段] 执行顺序: 同步发送后等待")
+        self._apply_stage_setpoints(
+            stage.get("temp"),
+            stage.get("press"),
+            stage.get("temp_rate"),
+            stage.get("press_rate"),
+            stage.get("temp_mode"),
+            stage.get("press_mode"),
+        )
+        self.wait_for_temp_press_stable()
 
     def _run_scope_cycles_for_stage(self, scope, save_dir: str, start_idx: int, cycles: int, stage_idx: int, stage_total: int):
         capture_mode = self.get_capture_mode()
@@ -2650,15 +2933,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     p_txt += " @ HOLD"
                 self.append_status(f"[阶段 {i}/{stage_total}] 目标: 温度={t_txt}, 压力={p_txt}")
 
-                self._apply_stage_setpoints(
-                    stage["temp"],
-                    stage["press"],
-                    stage.get("temp_rate"),
-                    stage.get("press_rate"),
-                    stage.get("temp_mode"),
-                    stage.get("press_mode"),
-                )
-                self.wait_for_temp_press_stable()
+                self._apply_stage_setpoints_and_wait(stage)
                 self.wait_light_source_stable()
                 stage_start_idx = start_idx
                 stage_end_target = stage_start_idx + cycles
@@ -2968,9 +3243,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 return None, None
         return None, None
 
-    def wait_for_temp_press_stable(self):
-        need_temp = self.temp_cal_btn.isChecked()
-        need_press = self.press_cal_btn.isChecked()
+    def wait_for_temp_press_stable(self, need_temp=None, need_press=None, reason: str = ""):
+        if need_temp is None:
+            need_temp = self.temp_cal_btn.isChecked()
+        if need_press is None:
+            need_press = self.press_cal_btn.isChecked()
         if not need_temp and not need_press:
             return
 
@@ -2990,7 +3267,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
             parts.append(f"温度目标={temp_target:.2f}±{temp_tol:.2f}")
         if need_press:
             parts.append(f"压力目标={press_target:.2f}±{press_tol:.2f}")
-        self.append_status(f"[稳定等待] 启动: {', '.join(parts)}")
+        reason_text = f"（{reason}）" if reason else ""
+        self.append_status(f"[稳定等待] 启动{reason_text}: {', '.join(parts)}")
 
         while True:
             paused_s = self._wait_while_paused()
