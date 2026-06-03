@@ -52,8 +52,6 @@ class LaserLifetimeCalibrationUI(QWidget):
         super().__init__()
         self.scope_com_port = "COM1"
         self.hotplate_com_port = "COM2"
-        self.hotplate_dialog = None
-        self.hotplate_panel = None
         self.hotplate_plot_panel = None
         self._plot_t0 = time.time()
         self._plot_ts = []
@@ -93,6 +91,10 @@ class LaserLifetimeCalibrationUI(QWidget):
 
         top_tools = QHBoxLayout()
         top_tools.setContentsMargins(0, 0, 0, 0)
+        self.test_mode_label = QLabel("测试模式：不会连接真实设备，将生成模拟数据")
+        self.test_mode_label.setObjectName("TestModeBanner")
+        self.test_mode_label.setVisible(False)
+        top_tools.addWidget(self.test_mode_label, 0, Qt.AlignLeft | Qt.AlignVCenter)
         top_tools.addStretch(1)
         top_tools.addWidget(settings_button, 0, Qt.AlignRight | Qt.AlignVCenter)
         main_layout.addLayout(top_tools)
@@ -101,31 +103,11 @@ class LaserLifetimeCalibrationUI(QWidget):
         main_layout.addWidget(self.build_middle_section(), 0)
         main_layout.addWidget(self.build_bottom_section(), 1)
 
-        self.hotplate_ctrl_btn.clicked.connect(self.open_hotplate_control_dialog)
         self.hide_spin_arrows()
 
     def hide_spin_arrows(self):
         for spin in self.findChildren(QAbstractSpinBox):
             spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
-
-    def open_hotplate_control_dialog(self):
-        if self.hotplate_dialog is None:
-            self.hotplate_dialog = QDialog(self)
-            self.hotplate_dialog.setWindowTitle("标定台手动控制")
-            self.hotplate_dialog.setMinimumSize(980, 420)
-            layout = QHBoxLayout(self.hotplate_dialog)
-            layout.setContentsMargins(10, 10, 10, 10)
-            layout.setSpacing(10)
-            if self.hotplate_plot_panel is not None:
-                layout.addWidget(self.hotplate_plot_panel, 3)
-            layout.addWidget(self.hotplate_panel, 2)
-            self.hotplate_dialog.setLayout(layout)
-        # Ensure spin boxes in this popup do not show up/down arrows.
-        for spin in self.hotplate_dialog.findChildren(QAbstractSpinBox):
-            spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self.hotplate_dialog.show()
-        self.hotplate_dialog.raise_()
-        self.hotplate_dialog.activateWindow()
 
     def _build_hotplate_plot_panel(self):
         box = PanelBox("实时曲线")
@@ -154,8 +136,7 @@ class LaserLifetimeCalibrationUI(QWidget):
         line_tf, = ax_temp.plot([], [], color="#ff9f43", linewidth=1.8, marker="o", markersize=2.5, label="TF")
         ax_temp.legend(loc="upper left")
         ax_temp.set_xlim(0, 1)
-        t0 = float(self.hotplate_tf_spin.value()) if hasattr(self, "hotplate_tf_spin") else 25.0
-        t_lo, t_hi = self._compute_y_limits([t0, t0])
+        t_lo, t_hi = self._compute_y_limits([25.0, 25.0])
         ax_temp.set_ylim(t_lo, t_hi)
         canvas_temp = FigureCanvas(temp_fig)
         temp_layout.addWidget(canvas_temp)
@@ -175,8 +156,7 @@ class LaserLifetimeCalibrationUI(QWidget):
         line_pf, = ax_press.plot([], [], color="#6c5ce7", linewidth=1.8, marker="o", markersize=2.5, label="PF")
         ax_press.legend(loc="upper left")
         ax_press.set_xlim(0, 1)
-        p0 = float(self.hotplate_pf_spin.value()) if hasattr(self, "hotplate_pf_spin") else 101.3
-        p_lo, p_hi = self._compute_y_limits([p0, p0])
+        p_lo, p_hi = self._compute_y_limits([101.3, 101.3])
         ax_press.set_ylim(p_lo, p_hi)
         canvas_press = FigureCanvas(press_fig)
         press_layout.addWidget(canvas_press)
@@ -214,10 +194,6 @@ class LaserLifetimeCalibrationUI(QWidget):
     def push_hotplate_plot(self, tc, pk, tf=None, pf=None):
         if self._plot_canvas_temp is None or self._plot_canvas_press is None or tc is None or pk is None:
             return
-        if tf is None and hasattr(self, "hotplate_tf_spin"):
-            tf = float(self.hotplate_tf_spin.value())
-        if pf is None and hasattr(self, "hotplate_pf_spin"):
-            pf = float(self.hotplate_pf_spin.value())
         if tf is None:
             tf = tc
         if pf is None:
@@ -263,13 +239,13 @@ class LaserLifetimeCalibrationUI(QWidget):
         self.single_mode_btn.setText("Single" if checked else "连续")
 
     def _sync_avg_mode_text(self, checked):
-        self.avg_checkbox.setText("平均" if checked else "采样")
+        self.avg_checkbox.setText("平均开启" if checked else "平均关闭")
 
     def _sync_start_btn_text(self, checked):
-        self.start_btn.setText("RUNNING" if checked else "RUN")
+        self.start_btn.setText("运行中" if checked else "开始")
 
     def _sync_fit_mode_text(self, checked):
-        self.fit_enable_btn.setText("拟合寿命" if checked else "不拟合")
+        self.fit_enable_btn.setText("拟合开启" if checked else "拟合关闭")
 
     def update_settings_tooltip(self):
         self.settings_button.setToolTip(f"示波器: {self.scope_com_port} | 标定台: {self.hotplate_com_port}")
@@ -341,203 +317,80 @@ class LaserLifetimeCalibrationUI(QWidget):
             self.update_settings_tooltip()
 
     def build_top_section(self):
-        box = PanelBox("基础参数区")
-        layout = QHBoxLayout()
-        layout.setSpacing(10)
+        box = PanelBox("工况与路径")
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
 
-        temp_box = PanelBox("温度标定")
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(10)
+
+        temp_box = PanelBox("温度")
         temp_grid = QGridLayout()
         temp_grid.setHorizontalSpacing(14)
         temp_grid.setVerticalSpacing(10)
 
-        temp_grid.addWidget(QLabel("温度标定:"), 0, 0)
         self.temp_cal_btn = QPushButton()
         self.temp_cal_btn.setObjectName("CalToggleButton")
         self.temp_cal_btn.setCheckable(True)
         self.temp_cal_btn.setChecked(True)
         self.temp_cal_btn.toggled.connect(lambda checked: self._sync_cal_toggle_text(self.temp_cal_btn, checked))
         self._sync_cal_toggle_text(self.temp_cal_btn, True)
-        temp_grid.addWidget(self.temp_cal_btn, 0, 1)
+        self.temp_cal_btn.setVisible(False)
 
-        temp_grid.addWidget(QLabel("参考温度 (°C):"), 0, 2)
+        temp_grid.addWidget(QLabel("参考温度 (°C):"), 0, 0)
         self.ref_temp_spin = QDoubleSpinBox()
         self.ref_temp_spin.setRange(-50, 800)
         self.ref_temp_spin.setValue(25.0)
         self.ref_temp_spin.setDecimals(1)
-        temp_grid.addWidget(self.ref_temp_spin, 0, 3)
-
-        temp_grid.addWidget(QLabel("温度范围:"), 1, 0)
-        temp_range_row = QFrame()
-        temp_range_layout = QHBoxLayout(temp_range_row)
-        temp_range_layout.setContentsMargins(0, 0, 0, 0)
-        temp_range_layout.setSpacing(8)
-        self.temp_range_start_spin = QDoubleSpinBox(); self.temp_range_start_spin.setRange(-50, 800); self.temp_range_start_spin.setDecimals(1); self.temp_range_start_spin.setValue(50.0)
-        self.temp_range_step_spin = QDoubleSpinBox(); self.temp_range_step_spin.setRange(0.1, 200); self.temp_range_step_spin.setDecimals(1); self.temp_range_step_spin.setValue(50.0)
-        self.temp_range_end_spin = QDoubleSpinBox(); self.temp_range_end_spin.setRange(-50, 800); self.temp_range_end_spin.setDecimals(1); self.temp_range_end_spin.setValue(600.0)
-        temp_range_layout.addWidget(self.temp_range_start_spin, 1)
-        temp_range_layout.addWidget(QLabel(":"))
-        temp_range_layout.addWidget(self.temp_range_step_spin, 1)
-        temp_range_layout.addWidget(QLabel(":"))
-        temp_range_layout.addWidget(self.temp_range_end_spin, 1)
-        temp_range_layout.addWidget(QLabel("(℃)"))
-        temp_grid.addWidget(temp_range_row, 1, 1, 1, 3)
-
-        temp_grid.addWidget(QLabel("温度波动阈值 (°C):"), 2, 0)
-        self.temp_fluc_spin = QDoubleSpinBox(); self.temp_fluc_spin.setRange(0, 50); self.temp_fluc_spin.setDecimals(2); self.temp_fluc_spin.setValue(0.20)
-        temp_grid.addWidget(self.temp_fluc_spin, 2, 1)
-        temp_grid.addWidget(QLabel("温稳时间 (s):"), 2, 2)
-        self.temp_stable_time_spin = QSpinBox(); self.temp_stable_time_spin.setRange(0, 3600); self.temp_stable_time_spin.setValue(300)
-        temp_grid.addWidget(self.temp_stable_time_spin, 2, 3)
-
-        temp_grid.addWidget(QLabel("控制模式:"), 3, 0)
-        self.temp_mode_combo = QComboBox(); self.temp_mode_combo.addItem("Ramp", "RAMP"); self.temp_mode_combo.addItem("Hold", "HOLD")
-        temp_grid.addWidget(self.temp_mode_combo, 3, 1)
-        temp_grid.addWidget(QLabel("升温速率 (℃/min):"), 3, 2)
-        self.temp_auto_rate_spin = QDoubleSpinBox(); self.temp_auto_rate_spin.setRange(0.1, 100); self.temp_auto_rate_spin.setDecimals(2); self.temp_auto_rate_spin.setValue(5.0)
-        temp_grid.addWidget(self.temp_auto_rate_spin, 3, 3)
-
-        temp_grid.addWidget(QLabel("自定义升温:"), 4, 0)
-        temp_custom_row = QFrame()
-        temp_custom_layout = QHBoxLayout(temp_custom_row)
-        temp_custom_layout.setContentsMargins(0, 0, 0, 0)
-        temp_custom_layout.setSpacing(8)
-        self.temp_custom_btn = QPushButton("关闭")
-        self.temp_custom_btn.setObjectName("CalToggleButton")
-        self.temp_custom_btn.setCheckable(True)
-        self.temp_custom_edit_btn = QPushButton("编辑温度路径")
-        self.temp_custom_edit_btn.setEnabled(False)
-        self.temp_manual_points_edit = QLineEdit()
-        self.temp_manual_points_edit.setVisible(False)
-        temp_custom_layout.addWidget(self.temp_custom_btn, 1)
-        temp_custom_layout.addWidget(self.temp_custom_edit_btn, 2)
-        temp_custom_layout.addWidget(self.temp_manual_points_edit)
-        temp_grid.addWidget(temp_custom_row, 4, 1, 1, 3)
+        temp_grid.addWidget(self.ref_temp_spin, 0, 1)
 
         temp_box.setLayout(temp_grid)
 
-        press_box = PanelBox("压力标定")
+        press_box = PanelBox("压力")
         press_grid = QGridLayout()
         press_grid.setHorizontalSpacing(14)
         press_grid.setVerticalSpacing(10)
 
-        press_grid.addWidget(QLabel("压力标定:"), 0, 0)
         self.press_cal_btn = QPushButton()
         self.press_cal_btn.setObjectName("CalToggleButton")
         self.press_cal_btn.setCheckable(True)
         self.press_cal_btn.setChecked(False)
         self.press_cal_btn.toggled.connect(lambda checked: self._sync_cal_toggle_text(self.press_cal_btn, checked))
         self._sync_cal_toggle_text(self.press_cal_btn, False)
-        press_grid.addWidget(self.press_cal_btn, 0, 1)
+        self.press_cal_btn.setVisible(False)
 
-        press_grid.addWidget(QLabel("参考压力 (kPa):"), 0, 2)
+        press_grid.addWidget(QLabel("参考压力 (kPa):"), 0, 0)
         self.ref_press_spin = QDoubleSpinBox(); self.ref_press_spin.setRange(0, 5000); self.ref_press_spin.setValue(101.3); self.ref_press_spin.setDecimals(1)
-        press_grid.addWidget(self.ref_press_spin, 0, 3)
-
-        press_grid.addWidget(QLabel("压力范围:"), 1, 0)
-        press_range_row = QFrame()
-        press_range_layout = QHBoxLayout(press_range_row)
-        press_range_layout.setContentsMargins(0, 0, 0, 0)
-        press_range_layout.setSpacing(8)
-        self.press_range_start_spin = QDoubleSpinBox(); self.press_range_start_spin.setRange(0, 5000); self.press_range_start_spin.setDecimals(1); self.press_range_start_spin.setValue(101.3)
-        self.press_range_step_spin = QDoubleSpinBox(); self.press_range_step_spin.setRange(0.1, 500); self.press_range_step_spin.setDecimals(1); self.press_range_step_spin.setValue(5.0)
-        self.press_range_end_spin = QDoubleSpinBox(); self.press_range_end_spin.setRange(0, 5000); self.press_range_end_spin.setDecimals(1); self.press_range_end_spin.setValue(121.3)
-        press_range_layout.addWidget(self.press_range_start_spin, 1)
-        press_range_layout.addWidget(QLabel(":"))
-        press_range_layout.addWidget(self.press_range_step_spin, 1)
-        press_range_layout.addWidget(QLabel(":"))
-        press_range_layout.addWidget(self.press_range_end_spin, 1)
-        press_range_layout.addWidget(QLabel("(kPa)"))
-        press_grid.addWidget(press_range_row, 1, 1, 1, 3)
-
-        press_grid.addWidget(QLabel("压力波动阈值 (kPa):"), 2, 0)
-        self.press_fluc_spin = QDoubleSpinBox(); self.press_fluc_spin.setRange(0, 100); self.press_fluc_spin.setDecimals(2); self.press_fluc_spin.setValue(0.50)
-        press_grid.addWidget(self.press_fluc_spin, 2, 1)
-        press_grid.addWidget(QLabel("压稳时间 (s):"), 2, 2)
-        self.press_stable_time_spin = QSpinBox(); self.press_stable_time_spin.setRange(0, 3600); self.press_stable_time_spin.setValue(300)
-        press_grid.addWidget(self.press_stable_time_spin, 2, 3)
-
-        press_grid.addWidget(QLabel("控制模式:"), 3, 0)
-        self.press_mode_combo = QComboBox(); self.press_mode_combo.addItem("Ramp", "RAMP"); self.press_mode_combo.addItem("Hold", "HOLD")
-        press_grid.addWidget(self.press_mode_combo, 3, 1)
-        press_grid.addWidget(QLabel("升压速率 (kPa/min):"), 3, 2)
-        self.press_auto_rate_spin = QDoubleSpinBox(); self.press_auto_rate_spin.setRange(0.1, 1000); self.press_auto_rate_spin.setDecimals(2); self.press_auto_rate_spin.setValue(5.0)
-        press_grid.addWidget(self.press_auto_rate_spin, 3, 3)
-
-        press_grid.addWidget(QLabel("自定义升压:"), 4, 0)
-        press_custom_row = QFrame()
-        press_custom_layout = QHBoxLayout(press_custom_row)
-        press_custom_layout.setContentsMargins(0, 0, 0, 0)
-        press_custom_layout.setSpacing(8)
-        self.press_custom_btn = QPushButton("关闭")
-        self.press_custom_btn.setObjectName("CalToggleButton")
-        self.press_custom_btn.setCheckable(True)
-        self.press_custom_edit_btn = QPushButton("编辑压力路径")
-        self.press_custom_edit_btn.setEnabled(False)
-        self.press_manual_points_edit = QLineEdit()
-        self.press_manual_points_edit.setVisible(False)
-        press_custom_layout.addWidget(self.press_custom_btn, 1)
-        press_custom_layout.addWidget(self.press_custom_edit_btn, 2)
-        press_custom_layout.addWidget(self.press_manual_points_edit)
-        press_grid.addWidget(press_custom_row, 4, 1, 1, 3)
+        press_grid.addWidget(self.ref_press_spin, 0, 1)
 
         press_box.setLayout(press_grid)
 
-        layout.addWidget(temp_box, 1)
-        layout.addWidget(press_box, 1)
+        controls_row.addWidget(temp_box, 1)
+        controls_row.addWidget(press_box, 1)
+        layout.addLayout(controls_row)
+
+        path_row = QFrame()
+        path_layout = QHBoxLayout(path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.setSpacing(8)
+        path_layout.addWidget(QLabel("路径方案:"), 0)
+        self.temp_custom_edit_btn = QPushButton("编辑温压路径")
+        self.temp_custom_edit_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.press_custom_edit_btn = self.temp_custom_edit_btn
+        self.path_summary_label = QLabel("温度路径未加载 / 压力路径未加载")
+        self.path_summary_label.setObjectName("PathSummaryLabel")
+        self.temp_manual_points_edit = QLineEdit()
+        self.temp_manual_points_edit.setVisible(False)
+        self.press_manual_points_edit = QLineEdit()
+        self.press_manual_points_edit.setVisible(False)
+        path_layout.addWidget(self.temp_custom_edit_btn, 1)
+        path_layout.addWidget(self.path_summary_label, 2)
+        path_layout.addWidget(self.temp_manual_points_edit)
+        path_layout.addWidget(self.press_manual_points_edit)
+        layout.addWidget(path_row)
+
         box.setLayout(layout)
         return box
-
-    def _build_hotplate_panel(self):
-        hotplate = PanelBox("标定台手动控制")
-        hotplate_grid = QGridLayout()
-        hotplate_grid.setHorizontalSpacing(12)
-        hotplate_grid.setVerticalSpacing(10)
-        hotplate_grid.setColumnStretch(0, 1)
-        hotplate_grid.setColumnStretch(1, 1)
-        hotplate_grid.setColumnMinimumWidth(1, 140)
-
-        hotplate_grid.addWidget(QLabel("TF (℃):"), 0, 0)
-        self.hotplate_tf_spin = QDoubleSpinBox(); self.hotplate_tf_spin.setRange(-100, 600); self.hotplate_tf_spin.setDecimals(1); self.hotplate_tf_spin.setValue(25.0)
-        hotplate_grid.addWidget(self.hotplate_tf_spin, 0, 1)
-
-        hotplate_grid.addWidget(QLabel("Rate (℃/min):"), 1, 0)
-        self.hotplate_rate_spin = QDoubleSpinBox(); self.hotplate_rate_spin.setRange(0.1, 100); self.hotplate_rate_spin.setDecimals(2); self.hotplate_rate_spin.setValue(5.0)
-        hotplate_grid.addWidget(self.hotplate_rate_spin, 1, 1)
-
-        self.hotplate_hold_btn = QPushButton("T-Hold")
-        self.hotplate_ramp_btn = QPushButton("T-Ramp")
-        self.hotplate_stop_btn = QPushButton("T-Stop")
-        self.hotplate_phold_btn = QPushButton("P-Hold")
-        self.hotplate_pramp_btn = QPushButton("P-Ramp")
-        self.hotplate_pstop_btn = QPushButton("P-Stop")
-        self.hotplate_stop_btn.setObjectName("StopButton")
-        self.hotplate_pstop_btn.setObjectName("StopButton")
-
-        for btn in (
-            self.hotplate_hold_btn, self.hotplate_ramp_btn, self.hotplate_stop_btn,
-            self.hotplate_phold_btn, self.hotplate_pramp_btn, self.hotplate_pstop_btn,
-        ):
-            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        hotplate_grid.addWidget(self.hotplate_hold_btn, 2, 0)
-        hotplate_grid.addWidget(self.hotplate_ramp_btn, 2, 1)
-        hotplate_grid.addWidget(self.hotplate_stop_btn, 3, 0, 1, 2)
-
-        hotplate_grid.addWidget(QLabel("PF (kPa):"), 4, 0)
-        self.hotplate_pf_spin = QDoubleSpinBox(); self.hotplate_pf_spin.setRange(0, 3000); self.hotplate_pf_spin.setDecimals(1); self.hotplate_pf_spin.setValue(101.3)
-        hotplate_grid.addWidget(self.hotplate_pf_spin, 4, 1)
-
-        hotplate_grid.addWidget(QLabel("P-Rate (kPa/min):"), 5, 0)
-        self.hotplate_prate_spin = QDoubleSpinBox(); self.hotplate_prate_spin.setRange(0.1, 1000); self.hotplate_prate_spin.setDecimals(2); self.hotplate_prate_spin.setValue(5.0)
-        hotplate_grid.addWidget(self.hotplate_prate_spin, 5, 1)
-
-        hotplate_grid.addWidget(self.hotplate_phold_btn, 6, 0)
-        hotplate_grid.addWidget(self.hotplate_pramp_btn, 6, 1)
-        hotplate_grid.addWidget(self.hotplate_pstop_btn, 7, 0, 1, 2)
-
-        hotplate.setLayout(hotplate_grid)
-        hotplate.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        return hotplate
 
     def build_middle_section(self):
         container = QFrame()
@@ -545,7 +398,7 @@ class LaserLifetimeCalibrationUI(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        left = PanelBox("标定流程设置")
+        left = PanelBox("运行设置")
         left_grid = QGridLayout()
         left_grid.setHorizontalSpacing(12)
         left_grid.setVerticalSpacing(10)
@@ -554,9 +407,15 @@ class LaserLifetimeCalibrationUI(QWidget):
         left_grid.setColumnStretch(5, 1)
 
         row = 0
-        left_grid.addWidget(QLabel("标定模式:"), row, 0)
-        mode_select = QComboBox(); mode_select.addItems(["寿命标定", "待开发"])
-        left_grid.addWidget(mode_select, row, 1)
+        left_grid.addWidget(QLabel("温压顺序:"), row, 0)
+        self.stage_control_order_combo = QComboBox()
+        self.stage_control_order_combo.addItem("温-压", "TEMP_THEN_PRESS")
+        self.stage_control_order_combo.addItem("压-温", "PRESS_THEN_TEMP")
+        self.stage_control_order_combo.setToolTip(
+            "温-压：先等待温度稳定，再发送压力目标。\n"
+            "压-温：先等待压力稳定，再发送温度目标。"
+        )
+        left_grid.addWidget(self.stage_control_order_combo, row, 1)
 
         left_grid.addWidget(QLabel("光源稳定时间 (s):"), row, 2)
         self.stable_time_spin = QSpinBox(); self.stable_time_spin.setRange(0, 3600); self.stable_time_spin.setValue(10)
@@ -567,7 +426,7 @@ class LaserLifetimeCalibrationUI(QWidget):
         left_grid.addWidget(self.cycles_spin, row, 5)
         row += 1
 
-        left_grid.addWidget(QLabel("选择保存路径:"), row, 0)
+        left_grid.addWidget(QLabel("保存路径:"), row, 0)
         self.save_path_edit = QLineEdit("D:/CalibrationData/LaserLifetime")
         left_grid.addWidget(self.save_path_edit, row, 1, 1, 4)
         self.browse_btn = QPushButton("浏览...")
@@ -595,12 +454,12 @@ class LaserLifetimeCalibrationUI(QWidget):
         left.setLayout(left_grid)
         left.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 
-        scope_box = PanelBox("示波器设置")
+        scope_box = PanelBox("采集设置")
         right_grid = QGridLayout()
         right_grid.setHorizontalSpacing(12)
         right_grid.setVerticalSpacing(10)
 
-        right_grid.addWidget(QLabel("采样模式:"), 0, 0)
+        right_grid.addWidget(QLabel("采样方式:"), 0, 0)
         self.single_mode_btn = QPushButton()
         self.single_mode_btn.setObjectName("SingleModeButton")
         self.single_mode_btn.setCheckable(True)
@@ -614,7 +473,7 @@ class LaserLifetimeCalibrationUI(QWidget):
         self.channel_combo = QComboBox(); self.channel_combo.addItems(["CH1", "CH2", "CH3", "CH4", "CH1 + CH2"])
         right_grid.addWidget(self.channel_combo, 1, 1)
 
-        right_grid.addWidget(QLabel("是否平均:"), 0, 2)
+        right_grid.addWidget(QLabel("平均:"), 0, 2)
         self.avg_checkbox = QPushButton()
         self.avg_checkbox.setObjectName("AvgModeButton")
         self.avg_checkbox.setCheckable(True)
@@ -630,8 +489,6 @@ class LaserLifetimeCalibrationUI(QWidget):
 
         scope_box.setLayout(right_grid)
         scope_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        self.hotplate_ctrl_btn = QPushButton("标定台手动控制")
-        self.hotplate_ctrl_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.fit_enable_btn = QPushButton()
         self.fit_enable_btn.setObjectName("FitModeButton")
         self.fit_enable_btn.setCheckable(True)
@@ -642,7 +499,6 @@ class LaserLifetimeCalibrationUI(QWidget):
         self.fit_settings_btn = QPushButton("拟合设置")
         self.fit_settings_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self.hotplate_panel = self._build_hotplate_panel()
         self.hotplate_plot_panel = self._build_hotplate_plot_panel()
 
         right_column = QFrame()
@@ -650,14 +506,13 @@ class LaserLifetimeCalibrationUI(QWidget):
         right_column_layout.setContentsMargins(0, 0, 0, 0)
         right_column_layout.setSpacing(8)
         right_column_layout.addWidget(scope_box)
-        hotplate_row = QFrame()
-        hotplate_row_layout = QHBoxLayout(hotplate_row)
-        hotplate_row_layout.setContentsMargins(0, 0, 0, 0)
-        hotplate_row_layout.setSpacing(8)
-        hotplate_row_layout.addWidget(self.hotplate_ctrl_btn, 1)
-        hotplate_row_layout.addWidget(self.fit_enable_btn, 1)
-        hotplate_row_layout.addWidget(self.fit_settings_btn, 1)
-        right_column_layout.addWidget(hotplate_row)
+        fit_row = QFrame()
+        fit_row_layout = QHBoxLayout(fit_row)
+        fit_row_layout.setContentsMargins(0, 0, 0, 0)
+        fit_row_layout.setSpacing(8)
+        fit_row_layout.addWidget(self.fit_enable_btn, 1)
+        fit_row_layout.addWidget(self.fit_settings_btn, 1)
+        right_column_layout.addWidget(fit_row)
         right_column_layout.addStretch(1)
 
         layout.addWidget(right_column, 4, Qt.AlignTop)
@@ -716,6 +571,21 @@ class LaserLifetimeCalibrationUI(QWidget):
             }
             QLabel {
                 min-height: 28px;
+            }
+            QLabel#TestModeBanner {
+                background: #fff3cd;
+                color: #7a5200;
+                border: 1px solid #e2c36b;
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-weight: 700;
+            }
+            QLabel#PathSummaryLabel {
+                color: #485766;
+                background: #f7f9fb;
+                border: 1px solid #d2dbe4;
+                border-radius: 4px;
+                padding: 3px 8px;
             }
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
                 background: #fcfcfd;

@@ -1,4 +1,5 @@
 ﻿from __future__ import annotations
+import json
 import os
 import re
 import sys
@@ -33,6 +34,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QHBoxLayout,
     QWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
@@ -54,12 +56,28 @@ HOTPLATE_QUERY_WAIT_S = 0.35
 PLOT_TICK_S = 0.2
 SIGGEN_BAUD = 115200
 SIGGEN_COMMAND_DELAY_S = 0.2
-TARGET_TOL_C = 0.5
 TARGET_HOLD_S = 20.0
 MAX_RAMP_RATE = 20.0
 SERIAL_PROBE_TIMEOUT_S = 0.1
 PRESS_CONTROL_SLAVE = 2
+TEST_MODE = False
+TEST_SIM_SPEEDUP = 120.0
+TEST_MAX_STABLE_HOLD_S = 2.0
+TEST_MAX_LIGHT_STABLE_S = 1.0
+DEFAULT_TEMP_TOL = 0.20
+DEFAULT_PRESS_TOL = 0.50
+DEFAULT_TEMP_HOLD_S = 300.0
+DEFAULT_PRESS_HOLD_S = 300.0
+TEST_CAPTURE_POINTS = 1000
+LOG_HOTPLATE_COMMANDS = False
+LOG_CAPTURE_DETAIL = False
+LOG_STAGE_DETAIL_LIMIT = 4
 FNAME_RE = re.compile(r"^T(\d+)(?:[_-]?(CH[1-4](?:CH[1-4])*))?\.CSV$", re.IGNORECASE)
+TEST_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xff\xff?"
+    b"\x00\x05\xfe\x02\xfeA\xe2!\xbc\x00\x00\x00\x00IEND\xaeB`\x82"
+)
 
 
 class ScopeProfile:
@@ -149,6 +167,16 @@ def normalize_stopafter(resp: str) -> str:
 
 class TaskStoppedError(Exception):
     pass
+
+
+class TestScope:
+    profile = PROFILE_DPO2024B
+
+    def close(self):
+        pass
+
+    def clear(self):
+        pass
 
 
 class ChannelDialog(QDialog):
@@ -725,6 +753,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.ramp_rate_cpm = None
         self.reach_inband_since = None
         self.reach_confirmed = False
+        self.current_temp_tol = None
+        self.current_temp_hold_s = None
         self.last_hotplate_s_status = None
         self.hotplate_guard_timer = QTimer(self)
         self.hotplate_guard_timer.setInterval(1200)
@@ -736,6 +766,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.press_ramp_rate_kpm = None
         self.press_reach_inband_since = None
         self.press_reach_confirmed = False
+        self.current_press_tol = None
+        self.current_press_hold_s = None
         self.last_hotplate_press_s_status = None
         self.press_guard_last_restart_ts = 0.0
         self.hotplate_press_guard_timer = QTimer(self)
@@ -751,11 +783,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.hotplate_live_err_suppressed = False
         self.last_live_tc = None
         self.last_live_pk = None
-        self.sim_tf_current = float(self.hotplate_tf_spin.value())
+        self.sim_tf_current = float(self.ref_temp_spin.value())
         self.sim_tf_target = self.sim_tf_current
         self.sim_rate_cpm = 0.0
         self.sim_temp_mode = "hold"  # "hold" | "ramp"
-        self.sim_pf_current = float(self.hotplate_pf_spin.value())
+        self.sim_pf_current = float(self.ref_press_spin.value())
         self.sim_pf_target = self.sim_pf_current
         self.sim_prate_kpm = 0.0
         self.sim_press_mode = "hold"  # "hold" | "ramp"
@@ -813,180 +845,31 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.avg_checkbox.toggled.connect(self.on_avg_toggled)
         self.single_mode_btn.toggled.connect(self.on_capture_mode_toggled)
         self.avg_count_combo.currentIndexChanged.connect(self.on_avg_count_changed)
-        self.hotplate_hold_btn.clicked.connect(self.send_hotplate_hold)
-        self.hotplate_ramp_btn.clicked.connect(self.send_hotplate_ramp)
-        self.hotplate_stop_btn.clicked.connect(self.send_hotplate_stop)
-        self.hotplate_phold_btn.clicked.connect(self.send_hotplate_press_hold)
-        self.hotplate_pramp_btn.clicked.connect(self.send_hotplate_press_ramp)
-        self.hotplate_pstop_btn.clicked.connect(self.send_hotplate_press_stop)
         self.fit_settings_btn.clicked.connect(self.open_lifetime_fit_settings)
         self.fit_enable_btn.toggled.connect(self.on_fit_enable_toggled)
-        self.temp_custom_btn.toggled.connect(lambda checked: self.on_custom_axis_toggled("temp", checked))
-        self.press_custom_btn.toggled.connect(lambda checked: self.on_custom_axis_toggled("press", checked))
-        self.temp_custom_edit_btn.clicked.connect(lambda: self.edit_custom_axis_path("temp"))
-        self.press_custom_edit_btn.clicked.connect(lambda: self.edit_custom_axis_path("press"))
+        self.temp_custom_edit_btn.clicked.connect(self.edit_custom_axis_path)
 
         self.on_avg_toggled(self.avg_checkbox.isChecked())
-        self._sync_custom_axis_ui("temp", self.temp_custom_btn.isChecked())
-        self._sync_custom_axis_ui("press", self.press_custom_btn.isChecked())
 
         self.load_port_settings()
         self.load_saved_path()
         self.load_fit_enable_setting()
         self.load_custom_axis_settings()
+        self.update_path_summary()
         self._install_stage_control_order_ui()
         self.load_stage_control_order_setting()
         self.settings_button.hide()
+        self.test_mode_label.setVisible(TEST_MODE)
         self._ui_init_done = True
         self.append_status("[系统] 已加载主窗口")
 
-    def _sync_custom_axis_ui(self, axis: str, checked: bool):
-        if axis == "temp":
-            btn = self.temp_custom_btn
-            edit_btn = self.temp_custom_edit_btn
-            controls = [
-                self.temp_range_start_spin,
-                self.temp_range_step_spin,
-                self.temp_range_end_spin,
-                self.temp_mode_combo,
-                self.temp_auto_rate_spin,
-            ]
-            if checked:
-                self.temp_mode_combo.setCurrentIndex(self.temp_mode_combo.findData("RAMP"))
-        else:
-            btn = self.press_custom_btn
-            edit_btn = self.press_custom_edit_btn
-            controls = [
-                self.press_range_start_spin,
-                self.press_range_step_spin,
-                self.press_range_end_spin,
-                self.press_mode_combo,
-                self.press_auto_rate_spin,
-            ]
-            if checked:
-                self.press_mode_combo.setCurrentIndex(self.press_mode_combo.findData("RAMP"))
-
-        btn.setText("自定义" if checked else "范围")
-        edit_btn.setEnabled(checked)
-        for control in controls:
-            control.setEnabled(not checked)
-
     def _install_stage_control_order_ui(self):
-        """把温压执行顺序嵌入“标定模式”输入区域，不再挤占流程设置整行。
-
-        设计思路：不要在“标定模式”这一行硬塞一组新的 label+combo 并整体右移，
-        而是把原来的标定模式下拉框与“顺序 温-压/压-温”组合成一个紧凑输入单元。
-        这样光源稳定时间、循环次数仍留在原位置，整行对称性更好。
-        """
-        if hasattr(self, "stage_control_order_combo"):
+        combo = getattr(self, "stage_control_order_combo", None)
+        if combo is None:
             return
-
-        self.stage_control_order_combo = QComboBox(self)
-        self.stage_control_order_combo.addItem("温-压", "TEMP_THEN_PRESS")
-        self.stage_control_order_combo.addItem("压-温", "PRESS_THEN_TEMP")
-        self.stage_control_order_combo.setFixedWidth(62)
-        self.stage_control_order_combo.setToolTip(
-            "温-压：先等待温度稳定，再发送压力目标。\n"
-            "压-温：先等待压力稳定，再发送温度目标。"
-        )
-        self.stage_control_order_combo.currentIndexChanged.connect(self.on_stage_control_order_changed)
-
-        order_label = QLabel("顺序:", self)
-        order_label.setToolTip(self.stage_control_order_combo.toolTip())
-        self.stage_control_order_label = order_label
-
-        def _find_item_at(layout: QGridLayout, row: int, col: int):
-            for idx in range(layout.count()):
-                item = layout.itemAt(idx)
-                if item is None:
-                    continue
-                r, c, rs, cs = layout.getItemPosition(idx)
-                if r == row and c == col:
-                    return idx, item, r, c, rs, cs
-            return None
-
-        def _embed_next_to_calibration_mode() -> bool:
-            for lab in self.findChildren(QLabel):
-                text = lab.text().replace(" ", "")
-                if not text.startswith("标定模式"):
-                    continue
-                parent = lab.parentWidget()
-                layout = parent.layout() if parent is not None else None
-                if not isinstance(layout, QGridLayout):
-                    continue
-
-                label_pos = None
-                for i in range(layout.count()):
-                    item = layout.itemAt(i)
-                    if item is not None and item.widget() is lab:
-                        label_pos = layout.getItemPosition(i)
-                        break
-                if label_pos is None:
-                    continue
-                row, col, _rowspan, _colspan = label_pos
-
-                mode_item_pack = _find_item_at(layout, row, col + 1)
-                if mode_item_pack is None:
-                    continue
-                item_index, item, _r, _c, rowspan, colspan = mode_item_pack
-                mode_widget = item.widget()
-                if mode_widget is None:
-                    continue
-
-                layout.takeAt(item_index)
-                container = QWidget(parent)
-                row_layout = QHBoxLayout(container)
-                row_layout.setContentsMargins(0, 0, 0, 0)
-                row_layout.setSpacing(4)
-                try:
-                    mode_widget.setFixedWidth(92)
-                except Exception:
-                    pass
-                try:
-                    self.stable_time_spin.setFixedWidth(68)
-                    self.cycles_spin.setFixedWidth(58)
-                except Exception:
-                    pass
-                row_layout.addWidget(mode_widget, 0)
-                row_layout.addWidget(order_label, 0)
-                row_layout.addWidget(self.stage_control_order_combo, 0)
-                layout.addWidget(container, row, col + 1, rowspan, colspan)
-                return True
-            return False
-
-        if _embed_next_to_calibration_mode():
-            return
-
-        # 回退：找不到“标定模式”时，放到流程设置区域第一行末尾，不改任何原按钮文字。
-        target_parent = None
-        for name in ("cycles_spin", "stable_time_spin", "start_btn", "stop_btn"):
-            widget = getattr(self, name, None)
-            if widget is not None and widget.parentWidget() is not None and widget.parentWidget().layout() is not None:
-                target_parent = widget.parentWidget()
-                break
-        if target_parent is None:
-            return
-        layout = target_parent.layout()
-        row_layout = QHBoxLayout()
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(4)
-        try:
-            self.stable_time_spin.setFixedWidth(68)
-            self.cycles_spin.setFixedWidth(58)
-        except Exception:
-            pass
-        row_layout.addWidget(order_label)
-        row_layout.addWidget(self.stage_control_order_combo)
-        row_layout.addStretch(1)
-        if isinstance(layout, QGridLayout):
-            row = 0
-            col = layout.columnCount()
-            layout.addLayout(row_layout, row, col, 1, 1)
-        else:
-            try:
-                layout.addLayout(row_layout)
-            except Exception:
-                pass
+        if not getattr(self, "_stage_control_order_connected", False):
+            combo.currentIndexChanged.connect(self.on_stage_control_order_changed)
+            self._stage_control_order_connected = True
 
     def load_stage_control_order_setting(self):
         # 使用新的 key，避免旧版本错误默认值“同步控温控压（原逻辑）”继续残留。
@@ -1019,47 +902,137 @@ class MainWindow(LaserLifetimeCalibrationUI):
         except Exception:
             return f"{value}{unit}"
 
+    def _format_value_list_preview(self, values, unit: str, limit: int = LOG_STAGE_DETAIL_LIMIT) -> str:
+        formatted = [self._format_condition_value(v, unit) for v in values]
+        if len(formatted) <= limit * 2:
+            return "，".join(formatted)
+        head = "，".join(formatted[:limit])
+        tail = "，".join(formatted[-limit:])
+        return f"{head}，...，{tail}"
+
     def _log_stage_condition_summary(self, temp_targets, press_targets, order: str):
         temp_values = [item.get("value") for item in temp_targets if item.get("value") is not None]
         press_values = [item.get("value") for item in press_targets if item.get("value") is not None]
 
         if temp_values and press_values:
-            groups = []
-            if order == "PRESS_THEN_TEMP":
-                for press in press_values:
-                    parts = [self._format_condition_value(press, "kPa")]
-                    parts.extend(self._format_condition_value(temp, "℃") for temp in temp_values)
-                    groups.append("，".join(parts))
-            else:
-                for temp in temp_values:
-                    parts = [self._format_condition_value(temp, "℃")]
-                    parts.extend(self._format_condition_value(press, "kPa") for press in press_values)
-                    groups.append("，".join(parts))
             total = len(temp_values) * len(press_values)
-            self.append_status(f"[阶段] 工况列表: {'；'.join(groups)}；总工况数={total}")
+            order_text = "压力优先" if order == "PRESS_THEN_TEMP" else "温度优先"
+            self.append_status(
+                f"[阶段] 工况摘要: 温度 {len(temp_values)} 点 ({self._format_value_list_preview(temp_values, '℃')})；"
+                f"压力 {len(press_values)} 点 ({self._format_value_list_preview(press_values, 'kPa')})；"
+                f"{order_text}；总工况数={total}"
+            )
             return
 
         if temp_values:
-            groups = [self._format_condition_value(temp, "℃") for temp in temp_values]
-            self.append_status(f"[阶段] 工况列表: {'；'.join(groups)}；总工况数={len(temp_values)}")
+            self.append_status(
+                f"[阶段] 工况摘要: 温度 {len(temp_values)} 点 ({self._format_value_list_preview(temp_values, '℃')})"
+            )
             return
 
         if press_values:
-            groups = [self._format_condition_value(press, "kPa") for press in press_values]
-            self.append_status(f"[阶段] 工况列表: {'；'.join(groups)}；总工况数={len(press_values)}")
+            self.append_status(
+                f"[阶段] 工况摘要: 压力 {len(press_values)} 点 ({self._format_value_list_preview(press_values, 'kPa')})"
+            )
             return
 
-        self.append_status("[阶段] 工况列表: 保持当前温度和压力；总工况数=1")
-
-    def on_custom_axis_toggled(self, axis: str, checked: bool):
-        self._sync_custom_axis_ui(axis, checked)
-        if self._ui_init_done:
-            self.persist_custom_axis_settings()
+        self.append_status("[阶段] 工况摘要: 保持当前温度和压力；总工况数=1")
 
     def _manual_axis_defaults(self, axis: str):
         if axis == "temp":
             return "温度", "℃", "℃/min", -50.0, 800.0, "新建升温"
         return "压力", "kPa", "kPa/min", 0.0, 5000.0, "新建升压"
+
+    def _default_axis_segments(self, axis: str) -> list[dict]:
+        if axis == "temp":
+            return [
+                {
+                    "start": 50.0,
+                    "step": 50.0,
+                    "end": 600.0,
+                    "mode": "RAMP",
+                    "rate": 5.0,
+                    "tol": DEFAULT_TEMP_TOL,
+                    "hold_s": DEFAULT_TEMP_HOLD_S,
+                }
+            ]
+        return [
+            {
+                "start": 101.3,
+                "step": 5.0,
+                "end": 121.3,
+                "mode": "RAMP",
+                "rate": 5.0,
+                "tol": DEFAULT_PRESS_TOL,
+                "hold_s": DEFAULT_PRESS_HOLD_S,
+            }
+        ]
+
+    @staticmethod
+    def _axis_path_file_filter() -> str:
+        return "标定路径 (*.json);;所有文件 (*)"
+
+    def _axis_path_payload(self, axis: str, segments: list[dict]) -> dict:
+        axis_name, value_unit, rate_unit, *_ = self._manual_axis_defaults(axis)
+        return {
+            "format": "AutoLifeCalAxisPath",
+            "version": 1,
+            "axis": axis,
+            "axis_name": axis_name,
+            "value_unit": value_unit,
+            "rate_unit": rate_unit,
+            "segments": segments,
+        }
+
+    def _segments_from_axis_path_payload(self, payload, axis: str) -> list[dict]:
+        if not isinstance(payload, dict):
+            raise RuntimeError("路径文件格式错误")
+        file_axis = payload.get("axis")
+        if file_axis not in (None, axis):
+            axis_name = "温度" if axis == "temp" else "压力"
+            raise RuntimeError(f"该文件不是{axis_name}路径")
+        segments = payload.get("segments")
+        if not isinstance(segments, list) or not segments:
+            raise RuntimeError("路径文件中没有有效路径段")
+
+        normalized = []
+        for idx, item in enumerate(segments, 1):
+            if not isinstance(item, dict):
+                raise RuntimeError(f"第 {idx} 段格式错误")
+            mode = str(item.get("mode", "RAMP")).strip().upper()
+            if mode not in {"RAMP", "HOLD"}:
+                raise RuntimeError(f"第 {idx} 段方式必须是 RAMP 或 HOLD")
+            try:
+                start = float(item["start"])
+                step = float(item["step"])
+                end = float(item["end"])
+                tol = float(item["tol"])
+                hold_s = float(item["hold_s"])
+                rate = None if mode == "HOLD" else float(item["rate"])
+            except (KeyError, TypeError, ValueError):
+                raise RuntimeError(f"第 {idx} 段字段不完整或不是数字")
+            if not all(np.isfinite(v) for v in (start, step, end, tol, hold_s)):
+                raise RuntimeError(f"第 {idx} 段包含无效数字")
+            if step <= 0:
+                raise RuntimeError(f"第 {idx} 段间隔必须大于 0")
+            if tol < 0:
+                raise RuntimeError(f"第 {idx} 段波动阈值不能小于 0")
+            if hold_s < 0:
+                raise RuntimeError(f"第 {idx} 段稳定时间不能小于 0")
+            if rate is not None and (not np.isfinite(rate) or rate <= 0):
+                raise RuntimeError(f"第 {idx} 段 Ramp 速率必须大于 0")
+            normalized.append(
+                {
+                    "start": start,
+                    "step": step,
+                    "end": end,
+                    "mode": mode,
+                    "rate": rate,
+                    "tol": tol,
+                    "hold_s": hold_s,
+                }
+            )
+        return normalized
 
     @staticmethod
     def _set_table_item_editable(item, editable: bool):
@@ -1144,6 +1117,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def _add_axis_segment_row(self, table, axis: str, segment: dict | None = None):
         row = table.rowCount()
+        default_tol = DEFAULT_TEMP_TOL if axis == "temp" else DEFAULT_PRESS_TOL
+        default_hold_s = DEFAULT_TEMP_HOLD_S if axis == "temp" else DEFAULT_PRESS_HOLD_S
         if segment is None:
             prev_end = None
             if row > 0:
@@ -1153,12 +1128,16 @@ class MainWindow(LaserLifetimeCalibrationUI):
             end = start + step
             mode = "RAMP"
             rate = 5.0
+            tol = default_tol
+            hold_s = default_hold_s
         else:
             start = float(segment["start"])
             step = float(segment["step"])
             end = float(segment["end"])
             mode = segment.get("mode") or "RAMP"
             rate = float(segment.get("rate") or 5.0)
+            tol = default_tol if segment.get("tol") is None else float(segment["tol"])
+            hold_s = default_hold_s if segment.get("hold_s") is None else float(segment["hold_s"])
 
         table.insertRow(row)
         table.blockSignals(True)
@@ -1167,6 +1146,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         table.setItem(row, 2, self._make_table_item(f"{end:g}"))
         table.setItem(row, 3, self._make_table_item("Hold" if mode == "HOLD" else "Ramp"))
         table.setItem(row, 4, self._make_table_item("" if mode == "HOLD" else f"{rate:g}", editable=(mode != "HOLD")))
+        table.setItem(row, 5, self._make_table_item(f"{tol:g}"))
+        table.setItem(row, 6, self._make_table_item(f"{hold_s:g}"))
         table.blockSignals(False)
         table.selectRow(row)
 
@@ -1187,7 +1168,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 "end": self._table_float(table, row, 2),
                 "mode": mode,
                 "rate": rate,
+                "tol": self._table_float(table, row, 5),
+                "hold_s": self._table_float(table, row, 6),
             }
+            if segment["tol"] < 0:
+                raise RuntimeError(f"第 {row + 1} 段波动阈值不能小于 0")
+            if segment["hold_s"] < 0:
+                raise RuntimeError(f"第 {row + 1} 段稳定时间不能小于 0")
             segments.append(segment)
         return segments
 
@@ -1198,7 +1185,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
             rate = "h" if segment["mode"] == "HOLD" else f"{float(segment['rate']):g}"
             lines.append(
                 f"{float(segment['start']):g}|{float(segment['step']):g}|"
-                f"{float(segment['end']):g}|{segment['mode']}|{rate}"
+                f"{float(segment['end']):g}|{segment['mode']}|{rate}|"
+                f"{float(segment['tol']):g}|{float(segment['hold_s']):g}"
             )
         return "\n".join(lines)
 
@@ -1210,7 +1198,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         segments = []
         for line in lines:
             parts = [part.strip() for part in line.split("|")]
-            if len(parts) != 5:
+            if len(parts) not in (5, 7):
                 return None
             try:
                 start, step, end = (float(parts[i]) for i in range(3))
@@ -1230,19 +1218,43 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     return None
                 if not np.isfinite(rate):
                     return None
-            segments.append({"start": start, "step": step, "end": end, "mode": mode, "rate": rate})
+            tol = None
+            hold_s = None
+            if len(parts) == 7:
+                try:
+                    tol = float(parts[5])
+                    hold_s = float(parts[6])
+                except ValueError:
+                    return None
+                if not all(np.isfinite(v) for v in (tol, hold_s)):
+                    return None
+            segments.append(
+                {
+                    "start": start,
+                    "step": step,
+                    "end": end,
+                    "mode": mode,
+                    "rate": rate,
+                    "tol": tol,
+                    "hold_s": hold_s,
+                }
+            )
         return segments
 
-    def edit_custom_axis_path(self, axis: str):
-        axis_name, value_unit, unit, _, _, add_text = self._manual_axis_defaults(axis)
-        edit = self.temp_manual_points_edit if axis == "temp" else self.press_manual_points_edit
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"编辑自定义{axis_name}路径")
-        dialog.resize(760, 360)
-        layout = QHBoxLayout(dialog)
-        table = QTableWidget(0, 5, dialog)
-        table.setHorizontalHeaderLabels([f"起点({value_unit})", f"间隔({value_unit})", f"终点({value_unit})", "方式", f"速率({unit})"])
+    def _make_axis_path_table(self, axis: str, parent) -> QTableWidget:
+        axis_name, value_unit, unit, *_ = self._manual_axis_defaults(axis)
+        table = QTableWidget(0, 7, parent)
+        table.setHorizontalHeaderLabels(
+            [
+                f"起点({value_unit})",
+                f"间隔({value_unit})",
+                f"终点({value_unit})",
+                "方式",
+                f"速率({unit})",
+                f"波动阈值({value_unit})",
+                "稳定时间(s)",
+            ]
+        )
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         table.verticalHeader().setVisible(False)
         table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1255,25 +1267,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
             "color: #102033;"
             "}"
         )
-        layout.addWidget(table, 1)
 
-        button_layout = QVBoxLayout()
-        add_btn = QPushButton(add_text)
-        del_btn = QPushButton("删除选中段")
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_layout.addWidget(add_btn)
-        button_layout.addWidget(del_btn)
-        button_layout.addStretch(1)
-        button_layout.addWidget(buttons)
-        layout.addLayout(button_layout)
-
+        edit = self.temp_manual_points_edit if axis == "temp" else self.press_manual_points_edit
         segments = self._parse_serialized_manual_axis(edit.text()) or []
         for segment in segments:
             self._add_axis_segment_row(table, axis, segment)
         if table.rowCount() == 0:
             self._add_axis_segment_row(table, axis)
-
-        add_btn.clicked.connect(lambda: self._add_axis_segment_row(table, axis))
 
         table_syncing = {"active": False}
 
@@ -1306,15 +1306,239 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 table_syncing["active"] = False
 
         table.itemChanged.connect(sync_after_edit)
+        return table
+
+    def _load_segments_into_axis_table(self, table, axis: str, segments: list[dict]):
+        table.setRowCount(0)
+        for segment in segments:
+            self._add_axis_segment_row(table, axis, segment)
+        self._refresh_axis_start_editability(table)
+        self._sync_axis_segment_starts(table)
+
+    def _axis_tables_to_segments(self, tables: dict[str, QTableWidget]) -> dict[str, list[dict]]:
+        result = {}
+        for axis, table in tables.items():
+            axis_name, *_ = self._manual_axis_defaults(axis)
+            segments = self._segments_from_axis_table(table)
+            text = self._serialize_manual_axis_segments(segments)
+            self._build_manual_axis_targets(text, axis_name)
+            result[axis] = segments
+        return result
+
+    def _path_plan_payload(self, segments_by_axis: dict[str, list[dict]]) -> dict:
+        return {
+            "format": "AutoLifeCalPathPlan",
+            "version": 1,
+            "paths": {
+                axis: self._axis_path_payload(axis, segments)
+                for axis, segments in segments_by_axis.items()
+            },
+        }
+
+    def update_path_summary(self):
+        label = getattr(self, "path_summary_label", None)
+        if label is None:
+            return
+        try:
+            temp_targets = self._build_manual_axis_targets(self.temp_manual_points_edit.text(), "温度")
+            press_targets = self._build_manual_axis_targets(self.press_manual_points_edit.text(), "压力")
+            temp_enabled = self.temp_cal_btn.isChecked()
+            press_enabled = self.press_cal_btn.isChecked()
+            temp_text = f"温度 {'启用' if temp_enabled else '关闭'} / {len(temp_targets)} 点" if temp_targets else "温度未配置"
+            press_text = f"压力 {'启用' if press_enabled else '关闭'} / {len(press_targets)} 点" if press_targets else "压力未配置"
+            total = (len(temp_targets) if temp_enabled and temp_targets else 1) * (
+                len(press_targets) if press_enabled and press_targets else 1
+            )
+            label.setText(f"{temp_text} / {press_text} / 总工况 {total}")
+        except Exception:
+            label.setText("路径需要检查")
+
+    def edit_custom_axis_path(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("编辑温压路径")
+        dialog.resize(1080, 460)
+        outer_layout = QVBoxLayout(dialog)
+
+        enable_row = QHBoxLayout()
+        temp_enable_btn = QPushButton()
+        temp_enable_btn.setObjectName("CalToggleButton")
+        temp_enable_btn.setCheckable(True)
+        temp_enable_btn.setChecked(self.temp_cal_btn.isChecked())
+        press_enable_btn = QPushButton()
+        press_enable_btn.setObjectName("CalToggleButton")
+        press_enable_btn.setCheckable(True)
+        press_enable_btn.setChecked(self.press_cal_btn.isChecked())
+        enable_hint = QLabel("参与标定:")
+        enable_row.addWidget(temp_enable_btn)
+        enable_row.addWidget(press_enable_btn)
+        enable_row.addStretch(1)
+        enable_row.insertWidget(0, enable_hint)
+        outer_layout.addLayout(enable_row)
+
+        layout = QHBoxLayout()
+        outer_layout.addLayout(layout, 1)
+
+        tabs = QTabWidget(dialog)
+        tables = {}
+        for axis, tab_name in (("temp", "温度路径"), ("press", "压力路径")):
+            page = QWidget(dialog)
+            page_layout = QVBoxLayout(page)
+            table = self._make_axis_path_table(axis, page)
+            page_layout.addWidget(table)
+            tabs.addTab(page, tab_name)
+            tables[axis] = table
+        layout.addWidget(tabs, 1)
+
+        def refresh_enable_labels():
+            temp_enable_btn.setText("温度：开启" if temp_enable_btn.isChecked() else "温度：关闭")
+            press_enable_btn.setText("压力：开启" if press_enable_btn.isChecked() else "压力：关闭")
+            temp_state = "启用" if temp_enable_btn.isChecked() else "关闭"
+            press_state = "启用" if press_enable_btn.isChecked() else "关闭"
+            tabs.setTabText(0, f"温度路径（{temp_state}，{tables['temp'].rowCount()}段）")
+            tabs.setTabText(1, f"压力路径（{press_state}，{tables['press'].rowCount()}段）")
+
+        temp_enable_btn.toggled.connect(lambda _checked: refresh_enable_labels())
+        press_enable_btn.toggled.connect(lambda _checked: refresh_enable_labels())
+        refresh_enable_labels()
+
+        button_layout = QVBoxLayout()
+        add_btn = QPushButton("新建段")
+        del_btn = QPushButton("删除选中段")
+        import_axis_btn = QPushButton("导入当前路径")
+        export_axis_btn = QPushButton("导出当前路径")
+        import_plan_btn = QPushButton("导入温压方案")
+        export_plan_btn = QPushButton("导出温压方案")
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        for btn in (add_btn, del_btn, import_axis_btn, export_axis_btn, import_plan_btn, export_plan_btn):
+            button_layout.addWidget(btn)
+        button_layout.addStretch(1)
+        button_layout.addWidget(buttons)
+        layout.addLayout(button_layout)
+
+        def current_axis():
+            return "temp" if tabs.currentIndex() == 0 else "press"
+
+        def current_table():
+            return tables[current_axis()]
+
+        def add_segment():
+            axis = current_axis()
+            self._add_axis_segment_row(tables[axis], axis)
+            refresh_enable_labels()
 
         def delete_selected():
+            axis = current_axis()
+            table = tables[axis]
             row = table.currentRow()
             if row >= 0:
                 table.removeRow(row)
                 self._refresh_axis_start_editability(table)
                 self._sync_axis_segment_starts(table)
+                refresh_enable_labels()
 
+        def import_axis_path():
+            axis = current_axis()
+            axis_name, *_ = self._manual_axis_defaults(axis)
+            file_path, _ = QFileDialog.getOpenFileName(dialog, f"导入{axis_name}路径", "", self._axis_path_file_filter())
+            if not file_path:
+                return
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                segments = self._segments_from_axis_path_payload(payload, axis)
+                self._build_manual_axis_targets(self._serialize_manual_axis_segments(segments), axis_name)
+            except Exception as ex:
+                QMessageBox.warning(dialog, "导入路径失败", str(ex))
+                return
+            self._load_segments_into_axis_table(tables[axis], axis, segments)
+            refresh_enable_labels()
+            self.append_status(f"[阶段] 已导入{axis_name}路径: {file_path}")
+
+        def export_axis_path():
+            axis = current_axis()
+            axis_name, value_unit, *_ = self._manual_axis_defaults(axis)
+            try:
+                segments = self._segments_from_axis_table(tables[axis])
+                self._build_manual_axis_targets(self._serialize_manual_axis_segments(segments), axis_name)
+            except RuntimeError as ex:
+                QMessageBox.warning(dialog, "导出路径失败", str(ex))
+                return
+            file_path, _ = QFileDialog.getSaveFileName(
+                dialog,
+                f"导出{axis_name}路径",
+                f"{axis_name}路径.json",
+                self._axis_path_file_filter(),
+            )
+            if not file_path:
+                return
+            if not file_path.lower().endswith(".json"):
+                file_path += ".json"
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(self._axis_path_payload(axis, segments), f, ensure_ascii=False, indent=2)
+            except Exception as ex:
+                QMessageBox.warning(dialog, "导出路径失败", str(ex))
+                return
+            targets = self._build_manual_axis_targets(self._serialize_manual_axis_segments(segments), axis_name)
+            self.append_status(f"[阶段] 已导出{axis_name}路径: {self._summarize_axis_targets(targets, value_unit)}")
+
+        def import_plan():
+            file_path, _ = QFileDialog.getOpenFileName(dialog, "导入温压方案", "", self._axis_path_file_filter())
+            if not file_path:
+                return
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if not isinstance(payload, dict) or payload.get("format") != "AutoLifeCalPathPlan":
+                    raise RuntimeError("该文件不是温压方案")
+                paths = payload.get("paths")
+                if not isinstance(paths, dict):
+                    raise RuntimeError("温压方案缺少 paths")
+                loaded = {
+                    axis: self._segments_from_axis_path_payload(paths.get(axis), axis)
+                    for axis in ("temp", "press")
+                }
+                for axis, segments in loaded.items():
+                    axis_name, *_ = self._manual_axis_defaults(axis)
+                    self._build_manual_axis_targets(self._serialize_manual_axis_segments(segments), axis_name)
+            except Exception as ex:
+                QMessageBox.warning(dialog, "导入方案失败", str(ex))
+                return
+            for axis, segments in loaded.items():
+                self._load_segments_into_axis_table(tables[axis], axis, segments)
+            refresh_enable_labels()
+            self.append_status(f"[阶段] 已导入温压方案: {file_path}")
+
+        def export_plan():
+            try:
+                segments_by_axis = self._axis_tables_to_segments(tables)
+            except RuntimeError as ex:
+                QMessageBox.warning(dialog, "导出方案失败", str(ex))
+                return
+            file_path, _ = QFileDialog.getSaveFileName(
+                dialog,
+                "导出温压方案",
+                "温压路径方案.json",
+                self._axis_path_file_filter(),
+            )
+            if not file_path:
+                return
+            if not file_path.lower().endswith(".json"):
+                file_path += ".json"
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(self._path_plan_payload(segments_by_axis), f, ensure_ascii=False, indent=2)
+            except Exception as ex:
+                QMessageBox.warning(dialog, "导出方案失败", str(ex))
+                return
+            self.append_status(f"[阶段] 已导出温压方案: {file_path}")
+
+        add_btn.clicked.connect(add_segment)
         del_btn.clicked.connect(delete_selected)
+        import_axis_btn.clicked.connect(import_axis_path)
+        export_axis_btn.clicked.connect(export_axis_path)
+        import_plan_btn.clicked.connect(import_plan)
+        export_plan_btn.clicked.connect(export_plan)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
 
@@ -1322,23 +1546,25 @@ class MainWindow(LaserLifetimeCalibrationUI):
             return
 
         try:
-            segments = self._segments_from_axis_table(table)
+            segments_by_axis = self._axis_tables_to_segments(tables)
         except RuntimeError as ex:
-            QMessageBox.warning(self, "自定义路径格式错误", str(ex))
-            return
-        text = self._serialize_manual_axis_segments(segments)
-        try:
-            targets = self._build_manual_axis_targets(text, axis_name)
-        except RuntimeError as ex:
-            QMessageBox.warning(self, "自定义路径格式错误", str(ex))
+            QMessageBox.warning(self, "路径格式错误", str(ex))
             return
 
-        edit.setText(text.strip())
-        segment_count, detail = self._describe_manual_axis_targets(targets, value_unit, unit)
-        self.append_status(
-            f"[阶段] 已更新自定义{axis_name}路径: {segment_count} 段，{len(targets)} 个目标点；{detail}"
-        )
+        self.temp_cal_btn.setChecked(temp_enable_btn.isChecked())
+        self.press_cal_btn.setChecked(press_enable_btn.isChecked())
+
+        summaries = []
+        for axis, segments in segments_by_axis.items():
+            axis_name, value_unit, *_ = self._manual_axis_defaults(axis)
+            text = self._serialize_manual_axis_segments(segments)
+            edit = self.temp_manual_points_edit if axis == "temp" else self.press_manual_points_edit
+            edit.setText(text.strip())
+            targets = self._build_manual_axis_targets(text, axis_name)
+            summaries.append(f"{axis_name}: {self._summarize_axis_targets(targets, value_unit)}")
+        self.append_status("[阶段] 已更新温压路径: " + "；".join(summaries))
         self.persist_custom_axis_settings()
+        self.update_path_summary()
 
     def append_status(self, text: str):
         line = self._append_log(self.status_log_text, text)
@@ -1434,16 +1660,21 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.fit_enable_btn.setChecked(bool(enabled))
 
     def load_custom_axis_settings(self):
-        self.temp_manual_points_edit.setText(self.settings.value("temp_manual_path", "", type=str))
-        self.press_manual_points_edit.setText(self.settings.value("press_manual_path", "", type=str))
-        self.temp_custom_btn.setChecked(self.settings.value("temp_custom_enabled", False, type=bool))
-        self.press_custom_btn.setChecked(self.settings.value("press_custom_enabled", False, type=bool))
-        self._sync_custom_axis_ui("temp", self.temp_custom_btn.isChecked())
-        self._sync_custom_axis_ui("press", self.press_custom_btn.isChecked())
+        self.temp_cal_btn.setChecked(self.settings.value("temp_axis_enabled", True, type=bool))
+        self.press_cal_btn.setChecked(self.settings.value("press_axis_enabled", False, type=bool))
+        temp_path = self.settings.value("temp_manual_path", "", type=str)
+        press_path = self.settings.value("press_manual_path", "", type=str)
+        if not temp_path.strip():
+            temp_path = self._serialize_manual_axis_segments(self._default_axis_segments("temp"))
+        if not press_path.strip():
+            press_path = self._serialize_manual_axis_segments(self._default_axis_segments("press"))
+        self.temp_manual_points_edit.setText(temp_path)
+        self.press_manual_points_edit.setText(press_path)
+        self.update_path_summary()
 
     def persist_custom_axis_settings(self):
-        self.settings.setValue("temp_custom_enabled", bool(self.temp_custom_btn.isChecked()))
-        self.settings.setValue("press_custom_enabled", bool(self.press_custom_btn.isChecked()))
+        self.settings.setValue("temp_axis_enabled", bool(self.temp_cal_btn.isChecked()))
+        self.settings.setValue("press_axis_enabled", bool(self.press_cal_btn.isChecked()))
         self.settings.setValue("temp_manual_path", self.temp_manual_points_edit.text().strip())
         self.settings.setValue("press_manual_path", self.press_manual_points_edit.text().strip())
 
@@ -1500,6 +1731,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.settings.remove("save_dir")
 
     def initialize_system(self):
+        if TEST_MODE:
+            self._auto_initialize_for_start()
+            self.append_status("[测试模式] 初始化已模拟完成")
+            return
+
         dialog = QDialog(self)
         dialog.setWindowTitle("初始化设置")
         dialog.setMinimumWidth(420)
@@ -1647,6 +1883,16 @@ class MainWindow(LaserLifetimeCalibrationUI):
         )
 
     def _auto_initialize_for_start(self):
+        if TEST_MODE:
+            self.resource_str = "TEST::SCOPE"
+            self.idn = "TEST,TEST_SCOPE,TESTMODE,0"
+            self.profile_name = "DPO2024B"
+            self.hotplate_com_port = self.hotplate_com_port or "TEST_HOTPLATE"
+            self.siggen_com_port = self.siggen_com_port or "TEST_SIGGEN"
+            self.start_hotplate_live_poll()
+            self.append_status("[测试模式] 自动初始化已跳过真实硬件连接")
+            return True, True, True
+
         self.persist_port_settings()
         self.update_settings_tooltip()
 
@@ -1760,6 +2006,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         return {"scope_com": scope_com, "hotplate_com": hotplate_com, "siggen_com": siggen_com, "message": msg}
 
     def _query_siggen(self, command: str):
+        if TEST_MODE:
+            return "1"
         if serial is None:
             raise RuntimeError("未安装 pyserial，请先执行: pip install pyserial")
         port = (self.siggen_com_port or "").strip()
@@ -1789,6 +2037,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 pass
 
     def _send_siggen_commands(self, commands):
+        if TEST_MODE:
+            self.append_status(f"[测试模式][信号发生器] 跳过真实命令: {', '.join(commands)}")
+            return
         if serial is None:
             raise RuntimeError("未安装 pyserial，请先执行: pip install pyserial")
         port = (self.siggen_com_port or "").strip()
@@ -1836,6 +2087,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.append_status(f"[信号发生器] 通道 {','.join(channels)} 输出命令已发送 -> {state}")
 
     def get_siggen_identity_status(self):
+        if TEST_MODE:
+            return True, "TEST_SIGGEN"
         if not (self.siggen_com_port or "").strip():
             return False, "未配置"
         try:
@@ -1849,6 +2102,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def wait_light_source_stable(self):
         wait_s = int(self.stable_time_spin.value())
+        if TEST_MODE:
+            wait_s = min(wait_s, int(TEST_MAX_LIGHT_STABLE_S))
         if wait_s <= 0:
             return
 
@@ -1878,9 +2133,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.append_status("[光源] 稳定等待完成，开始示波器保存")
 
     def start_hotplate_live_poll(self):
-        if serial is None:
+        if serial is None and not TEST_MODE:
             return
-        if not (self.hotplate_com_port or "").strip():
+        if not TEST_MODE and not (self.hotplate_com_port or "").strip():
             return
         if not self.hotplate_live_timer.isActive():
             self.hotplate_live_timer.start()
@@ -1892,6 +2147,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         now = time.time()
         dt = max(0.0, now - self.last_sim_ts)
         self.last_sim_ts = now
+        if TEST_MODE:
+            dt *= TEST_SIM_SPEEDUP
 
         if self.sim_temp_mode == "ramp":
             step = (self.sim_rate_cpm / 60.0) * dt
@@ -1921,6 +2178,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         )
  
     def get_hotplate_identity_status(self):
+        if TEST_MODE:
+            return True, "TEST_HOTPLATE"
         if not (self.hotplate_com_port or "").strip():
             return False, "未配置"
         try:
@@ -1944,7 +2203,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
     def poll_hotplate_live_data(self):
         if not self.data_log_enabled:
             return
-        if not (self.hotplate_com_port or "").strip():
+        if not TEST_MODE and not (self.hotplate_com_port or "").strip():
             return
         try:
             rt_resp, _ = self._query_hotplate("TEMPerature:RTINformation?")
@@ -1992,10 +2251,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         temp_target = float(self.ref_temp_spin.value())
         press_target = float(self.ref_press_spin.value())
-        temp_tol = float(self.temp_fluc_spin.value())
-        press_tol = float(self.press_fluc_spin.value())
-        temp_hold_s = int(self.temp_stable_time_spin.value())
-        press_hold_s = int(self.press_stable_time_spin.value())
+        temp_tol = float(DEFAULT_TEMP_TOL if self.current_temp_tol is None else self.current_temp_tol)
+        press_tol = float(DEFAULT_PRESS_TOL if self.current_press_tol is None else self.current_press_tol)
+        temp_hold_s = float(DEFAULT_TEMP_HOLD_S if self.current_temp_hold_s is None else self.current_temp_hold_s)
+        press_hold_s = float(DEFAULT_PRESS_HOLD_S if self.current_press_hold_s is None else self.current_press_hold_s)
 
         prev_temp_stable = self.live_temp_stable
         prev_press_stable = self.live_press_stable
@@ -2202,6 +2461,12 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def run_capture_once(self, scope, cycle_idx: int, total_cycles: int):
         self._check_task_control()
+        if TEST_MODE:
+            if LOG_CAPTURE_DETAIL:
+                self.append_status(f"[测试模式][循环 {cycle_idx}/{total_cycles}] 模拟采集完成")
+            time.sleep(0.05)
+            QApplication.processEvents()
+            return
         capture_mode = self.get_capture_mode()
         profile = scope.profile
         _w(scope, profile.stopafter_run_cmd)
@@ -2210,7 +2475,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         QApplication.processEvents()
 
         if capture_mode == "CONTINUOUS":
-            self.append_status(f"[循环 {cycle_idx}/{total_cycles}] 连续采样运行")
+            if LOG_CAPTURE_DETAIL:
+                self.append_status(f"[循环 {cycle_idx}/{total_cycles}] 连续采样运行")
             return
 
         _w(scope, profile.stopafter_single_cmd)
@@ -2226,11 +2492,29 @@ class MainWindow(LaserLifetimeCalibrationUI):
             acq = self.query_acquire_status(scope)
             is_running = acq["state"] == "1" and acq["trig_state"] != "SAVE"
             if not is_running:
-                self.append_status(f"[循环 {cycle_idx}/{total_cycles}] SINGLE完成, 触发状态={acq['trig_state']}")
+                if LOG_CAPTURE_DETAIL:
+                    self.append_status(f"[循环 {cycle_idx}/{total_cycles}] SINGLE完成, 触发状态={acq['trig_state']}")
                 return
             time.sleep(0.15)
             QApplication.processEvents()
         raise RuntimeError(f"第 {cycle_idx} 次循环等待 SINGLE 完成超时")
+
+    def _write_test_capture_files(self, save_dir: str, idx: int, stage_idx: int, cycle_no: int):
+        csv_data = {}
+        t = np.linspace(0.0, 1.0, TEST_CAPTURE_POINTS)
+        csv_data["TIME"] = t
+        for ch_index, ch in enumerate(sorted(self.selected_channels), start=1):
+            freq = 4.0 + ch_index
+            phase = stage_idx * 0.2 + cycle_no * 0.1
+            baseline = 0.05 * stage_idx
+            csv_data[ch] = baseline + np.sin(2 * np.pi * freq * t + phase) * np.exp(-2.5 * t)
+
+        csv_path = os.path.join(save_dir, make_filename(idx, self.selected_channels))
+        screenshot_path = os.path.join(save_dir, make_screenshot_filename(idx, self.selected_channels))
+        save_csv(csv_path, csv_data)
+        with open(screenshot_path, "wb") as f:
+            f.write(TEST_PNG_BYTES)
+        return csv_path, screenshot_path
 
     def with_scope(self):
         if not self.resource_str:
@@ -2239,6 +2523,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         return rm, scope
 
     def _close_scope_session(self, rm, scope, reason: str = ""):
+        if TEST_MODE:
+            return
         try:
             if scope:
                 try:
@@ -2273,6 +2559,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.try_lock_scope(show_error=False, verbose=False)
 
     def _open_scope_session_with_recovery(self, reason: str = "采集", max_attempts: int = 4):
+        if TEST_MODE:
+            self.resource_str = self.resource_str or "TEST::SCOPE"
+            self.profile_name = self.profile_name or "DPO2024B"
+            return None, TestScope()
+
         errors = []
         for attempt in range(1, max_attempts + 1):
             rm = scope = None
@@ -2314,6 +2605,14 @@ class MainWindow(LaserLifetimeCalibrationUI):
         return any(m in text for m in markers)
 
     def try_lock_scope(self, show_error=True, verbose=True):
+        if TEST_MODE:
+            self.resource_str = "TEST::SCOPE"
+            self.idn = "TEST,TEST_SCOPE,TESTMODE,0"
+            self.profile_name = "DPO2024B"
+            if verbose:
+                self.append_status("[测试模式] 示波器锁定已模拟")
+            return True, "TESTMODE"
+
         try:
             cached_resource = self.settings.value("scope_resource_str", "", type=str)
             device_info = discover_scope_resource_robust(SERIAL_LOCK, cached_resource=cached_resource)
@@ -2341,27 +2640,6 @@ class MainWindow(LaserLifetimeCalibrationUI):
             return False, "未连接"
 
     @staticmethod
-    def _build_axis_values(start: float, step: float, end: float, name: str) -> list[float]:
-        if step <= 0:
-            raise RuntimeError(f"{name} 步进必须大于 0")
-
-        values: list[float] = []
-        cur = start
-        eps = max(abs(step) * 1e-9, 1e-9)
-        direction = 1 if end >= start else -1
-        guard = 0
-        while (direction > 0 and cur <= end + eps) or (direction < 0 and cur >= end - eps):
-            values.append(round(cur, 6))
-            cur += direction * step
-            guard += 1
-            if guard > 20000:
-                raise RuntimeError(f"{name} 阶段数量异常，请检查范围与步进")
-        return values
-
-    def _build_range_axis_targets(self, start: float, step: float, end: float, name: str) -> list[dict]:
-        return [{"value": float(v), "rate": None, "mode": None} for v in self._build_axis_values(start, step, end, name)]
-
-    @staticmethod
     def _build_manual_axis_targets(text: str, name: str) -> list[dict]:
         text = text.strip()
         if not text:
@@ -2377,6 +2655,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 end = float(segment["end"])
                 mode = segment["mode"]
                 rate = segment["rate"]
+                tol = segment.get("tol")
+                hold_s = segment.get("hold_s")
                 if not all(np.isfinite(v) for v in (start, step, end)):
                     raise RuntimeError(f"{name}自定义路径包含无效数字")
                 if step <= 0:
@@ -2384,6 +2664,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 if mode == "RAMP":
                     if rate is None or not np.isfinite(float(rate)) or float(rate) <= 0:
                         raise RuntimeError(f"{name}自定义路径 Ramp 速率必须大于 0")
+                if tol is not None and (not np.isfinite(float(tol)) or float(tol) < 0):
+                    raise RuntimeError(f"{name}自定义路径波动阈值不能小于 0")
+                if hold_s is not None and (not np.isfinite(float(hold_s)) or float(hold_s) < 0):
+                    raise RuntimeError(f"{name}自定义路径稳定时间不能小于 0")
                 if targets and abs(targets[-1]["value"] - start) > eps:
                     raise RuntimeError(
                         f"{name}自定义路径不连续：上一段终点 {targets[-1]['value']:.6g}，"
@@ -2395,13 +2679,21 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 guard = 0
                 while (direction > 0 and cur <= end + eps) or (direction < 0 and cur >= end - eps):
                     if not targets or abs(targets[-1]["value"] - cur) > eps:
-                        targets.append({"value": round(cur, 6), "rate": rate, "mode": mode})
+                        targets.append(
+                            {
+                                "value": round(cur, 6),
+                                "rate": rate,
+                                "mode": mode,
+                                "tol": tol,
+                                "hold_s": hold_s,
+                            }
+                        )
                     cur += direction * step
                     guard += 1
                     if guard > 20000:
                         raise RuntimeError(f"{name}自定义路径阶段数量异常，请检查间隔")
                 if not targets or abs(targets[-1]["value"] - end) > eps:
-                    targets.append({"value": end, "rate": rate, "mode": mode})
+                    targets.append({"value": end, "rate": rate, "mode": mode, "tol": tol, "hold_s": hold_s})
             return targets
 
         targets: list[dict] = []
@@ -2450,37 +2742,54 @@ class MainWindow(LaserLifetimeCalibrationUI):
             end = targets[i]["value"]
             mode = targets[i].get("mode")
             rate = targets[i].get("rate")
+            tol = targets[i].get("tol")
+            hold_s = targets[i].get("hold_s")
+            stable_text = ""
+            if tol is not None and hold_s is not None:
+                stable_text = f"，±{float(tol):g}{value_unit}/{float(hold_s):g}s"
             if mode == "HOLD":
-                parts.append(f"{i}. {start:g}{value_unit} -> HOLD -> {end:g}{value_unit}")
+                parts.append(f"{i}. {start:g}{value_unit} -> HOLD -> {end:g}{value_unit}{stable_text}")
             else:
-                parts.append(f"{i}. {start:g}{value_unit} -> {rate:g}{rate_unit} -> {end:g}{value_unit}")
+                parts.append(f"{i}. {start:g}{value_unit} -> {rate:g}{rate_unit} -> {end:g}{value_unit}{stable_text}")
         return len(parts), "; ".join(parts)
 
+    def _summarize_axis_targets(self, targets: list[dict], value_unit: str) -> str:
+        values = [item.get("value") for item in targets if item.get("value") is not None]
+        if not values:
+            return "空"
+        ramp_count = sum(1 for item in targets[1:] if item.get("mode") != "HOLD")
+        hold_count = sum(1 for item in targets[1:] if item.get("mode") == "HOLD")
+        rates = sorted({float(item["rate"]) for item in targets if item.get("rate") is not None})
+        tols = sorted({float(item["tol"]) for item in targets if item.get("tol") is not None})
+        holds = sorted({float(item["hold_s"]) for item in targets if item.get("hold_s") is not None})
+        parts = [
+            f"{len(targets) - 1} 段",
+            f"{len(targets)} 点",
+            f"{self._format_value_list_preview(values, value_unit)}",
+        ]
+        if ramp_count and hold_count:
+            parts.append(f"Ramp {ramp_count} / Hold {hold_count}")
+        elif hold_count:
+            parts.append(f"Hold {hold_count}")
+        if rates:
+            parts.append(f"速率 {self._format_value_list_preview(rates, value_unit + '/min')}")
+        if tols:
+            parts.append(f"阈值 ±{self._format_value_list_preview(tols, value_unit)}")
+        if holds:
+            parts.append(f"稳定 {self._format_value_list_preview(holds, 's')}")
+        return "；".join(parts)
+
     def _build_temp_axis_targets(self) -> list[dict]:
-        if self.temp_custom_btn.isChecked():
-            manual = self._build_manual_axis_targets(self.temp_manual_points_edit.text(), "温度")
-            if not manual:
-                raise RuntimeError("已开启自定义升温，请先编辑温度路径")
-            return manual
-        return self._build_range_axis_targets(
-            float(self.temp_range_start_spin.value()),
-            float(self.temp_range_step_spin.value()),
-            float(self.temp_range_end_spin.value()),
-            "温度范围",
-        )
+        manual = self._build_manual_axis_targets(self.temp_manual_points_edit.text(), "温度")
+        if not manual:
+            raise RuntimeError("请先编辑温度路径")
+        return manual
 
     def _build_press_axis_targets(self) -> list[dict]:
-        if self.press_custom_btn.isChecked():
-            manual = self._build_manual_axis_targets(self.press_manual_points_edit.text(), "压力")
-            if not manual:
-                raise RuntimeError("已开启自定义升压，请先编辑压力路径")
-            return manual
-        return self._build_range_axis_targets(
-            float(self.press_range_start_spin.value()),
-            float(self.press_range_step_spin.value()),
-            float(self.press_range_end_spin.value()),
-            "压力范围",
-        )
+        manual = self._build_manual_axis_targets(self.press_manual_points_edit.text(), "压力")
+        if not manual:
+            raise RuntimeError("请先编辑压力路径")
+        return manual
 
     @staticmethod
     def _rate_limit_message(name: str, rate: float, unit: str) -> str:
@@ -2498,20 +2807,16 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def _validate_auto_ramp_rates(self) -> bool:
         try:
-            if self.temp_cal_btn.isChecked() and (self.temp_mode_combo.currentData() or "RAMP") == "RAMP":
+            if self.temp_cal_btn.isChecked():
                 temp_targets = self._build_temp_axis_targets()
                 rates = [item["rate"] for item in temp_targets if item["rate"] is not None]
-                if not rates and not self.temp_custom_btn.isChecked():
-                    rates = [float(self.temp_auto_rate_spin.value())]
                 for rate in rates:
                     if not self._validate_ramp_rate("标定台参数错误", "升温速率", float(rate), "℃/min"):
                         return False
 
-            if self.press_cal_btn.isChecked() and (self.press_mode_combo.currentData() or "RAMP") == "RAMP":
+            if self.press_cal_btn.isChecked():
                 press_targets = self._build_press_axis_targets()
                 rates = [item["rate"] for item in press_targets if item["rate"] is not None]
-                if not rates and not self.press_custom_btn.isChecked():
-                    rates = [float(self.press_auto_rate_spin.value())]
                 for rate in rates:
                     if not self._validate_ramp_rate("压力参数错误", "升压速率", float(rate), "kPa/min"):
                         return False
@@ -2529,18 +2834,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
         press_targets = [{"value": None, "rate": None}]
         if need_temp:
             temp_targets = self._build_temp_axis_targets()
-            if self.temp_custom_btn.isChecked():
-                segment_count, detail = self._describe_manual_axis_targets(temp_targets, "℃", "℃/min")
-                self.append_status(
-                    f"[阶段] 自定义温度路径: {segment_count} 段，{len(temp_targets)} 个目标点；{detail}"
-                )
+            self.append_status(f"[阶段] 温度路径: {self._summarize_axis_targets(temp_targets, '℃')}")
         if need_press:
             press_targets = self._build_press_axis_targets()
-            if self.press_custom_btn.isChecked():
-                segment_count, detail = self._describe_manual_axis_targets(press_targets, "kPa", "kPa/min")
-                self.append_status(
-                    f"[阶段] 自定义压力路径: {segment_count} 段，{len(press_targets)} 个目标点；{detail}"
-                )
+            self.append_status(f"[阶段] 压力路径: {self._summarize_axis_targets(press_targets, 'kPa')}")
 
         if need_temp and need_press:
             stages = []
@@ -2553,9 +2850,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
                                 "temp": float(temp["value"]),
                                 "temp_rate": temp["rate"],
                                 "temp_mode": temp.get("mode"),
+                                "temp_tol": temp.get("tol"),
+                                "temp_hold_s": temp.get("hold_s"),
                                 "press": float(press["value"]),
                                 "press_rate": press["rate"],
                                 "press_mode": press.get("mode"),
+                                "press_tol": press.get("tol"),
+                                "press_hold_s": press.get("hold_s"),
                                 # 压力优先遍历时，压力组切换后需要先把温度拉回本轮温度起点，
                                 # 再切换到新的压力，避免在上一轮高温末点直接改压力。
                                 "pre_temp_before_press": press_idx > 0 and temp_idx == 0,
@@ -2572,9 +2873,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
                                 "temp": float(temp["value"]),
                                 "temp_rate": temp["rate"],
                                 "temp_mode": temp.get("mode"),
+                                "temp_tol": temp.get("tol"),
+                                "temp_hold_s": temp.get("hold_s"),
                                 "press": float(press["value"]),
                                 "press_rate": press["rate"],
                                 "press_mode": press.get("mode"),
+                                "press_tol": press.get("tol"),
+                                "press_hold_s": press.get("hold_s"),
                             }
                         )
                 priority_text = "按温度优先遍历，阶段内先控温后控压（原逻辑）"
@@ -2586,9 +2891,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
                                 "temp": float(temp["value"]),
                                 "temp_rate": temp["rate"],
                                 "temp_mode": temp.get("mode"),
+                                "temp_tol": temp.get("tol"),
+                                "temp_hold_s": temp.get("hold_s"),
                                 "press": float(press["value"]),
                                 "press_rate": press["rate"],
                                 "press_mode": press.get("mode"),
+                                "press_tol": press.get("tol"),
+                                "press_hold_s": press.get("hold_s"),
                             }
                         )
                 priority_text = "按温度优先遍历，阶段内先控温后控压（原逻辑）"
@@ -2604,6 +2913,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     "temp": float(item["value"]),
                     "temp_rate": item["rate"],
                     "temp_mode": item.get("mode"),
+                    "temp_tol": item.get("tol"),
+                    "temp_hold_s": item.get("hold_s"),
                     "press": None,
                     "press_rate": None,
                     "press_mode": None,
@@ -2621,6 +2932,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     "press": float(item["value"]),
                     "press_rate": item["rate"],
                     "press_mode": item.get("mode"),
+                    "press_tol": item.get("tol"),
+                    "press_hold_s": item.get("hold_s"),
                 }
                 for item in press_targets
             ]
@@ -2637,13 +2950,17 @@ class MainWindow(LaserLifetimeCalibrationUI):
         press_rate: float | None = None,
         temp_mode_override: str | None = None,
         press_mode_override: str | None = None,
+        temp_tol: float | None = None,
+        temp_hold_s: float | None = None,
+        press_tol: float | None = None,
+        press_hold_s: float | None = None,
     ):
         if temp_target is not None:
             self.ref_temp_spin.setValue(temp_target)
-            self.hotplate_tf_spin.setValue(temp_target)
-            mode = temp_mode_override or self.temp_mode_combo.currentData() or "RAMP"
-            rate = float(temp_rate if temp_rate is not None else self.temp_auto_rate_spin.value())
-            self.hotplate_rate_spin.setValue(rate)
+            self.current_temp_tol = temp_tol
+            self.current_temp_hold_s = temp_hold_s
+            mode = temp_mode_override or "RAMP"
+            rate = float(temp_rate if temp_rate is not None else 5.0)
             if mode == "RAMP":
                 self._send_hotplate_commands(
                     [
@@ -2679,10 +2996,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         if press_target is not None:
             self.ref_press_spin.setValue(press_target)
-            self.hotplate_pf_spin.setValue(press_target)
-            mode = press_mode_override or self.press_mode_combo.currentData() or "RAMP"
-            rate = float(press_rate if press_rate is not None else self.press_auto_rate_spin.value())
-            self.hotplate_prate_spin.setValue(rate)
+            self.current_press_tol = press_tol
+            self.current_press_hold_s = press_hold_s
+            mode = press_mode_override or "RAMP"
+            rate = float(press_rate if press_rate is not None else 5.0)
             if mode == "RAMP":
                 self._send_hotplate_commands(
                     [
@@ -2717,6 +3034,17 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self._reset_press_ramp_guard_state()
                 self.append_status(f"[阶段] 压力设定: HOLD -> {press_target:.2f} kPa")
 
+    def _wait_for_stage_stability(self, stage: dict, need_temp=None, need_press=None, reason: str = ""):
+        self.wait_for_temp_press_stable(
+            need_temp=need_temp,
+            need_press=need_press,
+            reason=reason,
+            temp_tol=stage.get("temp_tol"),
+            press_tol=stage.get("press_tol"),
+            temp_hold_s=stage.get("temp_hold_s"),
+            press_hold_s=stage.get("press_hold_s"),
+        )
+
     def _apply_stage_setpoints_and_wait(self, stage: dict):
         """按用户选择的温压顺序执行阶段设定，并等待对应通道稳定。"""
         order = self._stage_control_order()
@@ -2733,8 +3061,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     None,
                     stage.get("temp_mode"),
                     None,
+                    temp_tol=stage.get("temp_tol"),
+                    temp_hold_s=stage.get("temp_hold_s"),
                 )
-                self.wait_for_temp_press_stable(need_temp=True, need_press=False, reason="切换压力前温度先达标")
+                self._wait_for_stage_stability(stage, need_temp=True, need_press=False, reason="切换压力前温度先达标")
                 self._apply_stage_setpoints(
                     None,
                     stage["press"],
@@ -2742,9 +3072,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     stage.get("press_rate"),
                     None,
                     stage.get("press_mode"),
+                    press_tol=stage.get("press_tol"),
+                    press_hold_s=stage.get("press_hold_s"),
                 )
-                self.wait_for_temp_press_stable(need_temp=False, need_press=True, reason="压力切换后达标")
-                self.wait_for_temp_press_stable(need_temp=True, need_press=True, reason="温压最终确认")
+                self._wait_for_stage_stability(stage, need_temp=False, need_press=True, reason="压力切换后达标")
+                self._wait_for_stage_stability(stage, need_temp=True, need_press=True, reason="温压最终确认")
                 return
 
             if stage.get("press_already_set"):
@@ -2756,9 +3088,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     None,
                     stage.get("temp_mode"),
                     None,
+                    temp_tol=stage.get("temp_tol"),
+                    temp_hold_s=stage.get("temp_hold_s"),
                 )
-                self.wait_for_temp_press_stable(need_temp=True, need_press=False, reason="温度达标")
-                self.wait_for_temp_press_stable(need_temp=True, need_press=True, reason="温压最终确认")
+                self._wait_for_stage_stability(stage, need_temp=True, need_press=False, reason="温度达标")
+                self._wait_for_stage_stability(stage, need_temp=True, need_press=True, reason="温压最终确认")
                 return
 
             self.append_status("[阶段] 执行顺序: 先控压，压力稳定后再控温")
@@ -2769,8 +3103,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 stage.get("press_rate"),
                 None,
                 stage.get("press_mode"),
+                press_tol=stage.get("press_tol"),
+                press_hold_s=stage.get("press_hold_s"),
             )
-            self.wait_for_temp_press_stable(need_temp=False, need_press=True, reason="压力先达标")
+            self._wait_for_stage_stability(stage, need_temp=False, need_press=True, reason="压力先达标")
             self._apply_stage_setpoints(
                 stage["temp"],
                 None,
@@ -2778,9 +3114,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 None,
                 stage.get("temp_mode"),
                 None,
+                temp_tol=stage.get("temp_tol"),
+                temp_hold_s=stage.get("temp_hold_s"),
             )
-            self.wait_for_temp_press_stable(need_temp=True, need_press=False, reason="温度后达标")
-            self.wait_for_temp_press_stable(need_temp=True, need_press=True, reason="温压最终确认")
+            self._wait_for_stage_stability(stage, need_temp=True, need_press=False, reason="温度后达标")
+            self._wait_for_stage_stability(stage, need_temp=True, need_press=True, reason="温压最终确认")
             return
 
         if has_temp and has_press and order == "TEMP_THEN_PRESS":
@@ -2792,8 +3130,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 None,
                 stage.get("temp_mode"),
                 None,
+                temp_tol=stage.get("temp_tol"),
+                temp_hold_s=stage.get("temp_hold_s"),
             )
-            self.wait_for_temp_press_stable(need_temp=True, need_press=False, reason="温度先达标")
+            self._wait_for_stage_stability(stage, need_temp=True, need_press=False, reason="温度先达标")
             self._apply_stage_setpoints(
                 None,
                 stage["press"],
@@ -2801,9 +3141,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 stage.get("press_rate"),
                 None,
                 stage.get("press_mode"),
+                press_tol=stage.get("press_tol"),
+                press_hold_s=stage.get("press_hold_s"),
             )
-            self.wait_for_temp_press_stable(need_temp=False, need_press=True, reason="压力后达标")
-            self.wait_for_temp_press_stable(need_temp=True, need_press=True, reason="温压最终确认")
+            self._wait_for_stage_stability(stage, need_temp=False, need_press=True, reason="压力后达标")
+            self._wait_for_stage_stability(stage, need_temp=True, need_press=True, reason="温压最终确认")
             return
 
         if has_temp and has_press:
@@ -2815,8 +3157,12 @@ class MainWindow(LaserLifetimeCalibrationUI):
             stage.get("press_rate"),
             stage.get("temp_mode"),
             stage.get("press_mode"),
+            temp_tol=stage.get("temp_tol"),
+            temp_hold_s=stage.get("temp_hold_s"),
+            press_tol=stage.get("press_tol"),
+            press_hold_s=stage.get("press_hold_s"),
         )
-        self.wait_for_temp_press_stable()
+        self._wait_for_stage_stability(stage)
 
     def _run_scope_cycles_for_stage(self, scope, save_dir: str, start_idx: int, cycles: int, stage_idx: int, stage_total: int):
         capture_mode = self.get_capture_mode()
@@ -2824,23 +3170,31 @@ class MainWindow(LaserLifetimeCalibrationUI):
         for n in range(cycles):
             self._check_task_control()
             cycle_no = n + 1
-            if capture_mode == "SINGLE":
-                self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] RUN -> SINGLE")
-            else:
-                self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] RUN")
+            if LOG_CAPTURE_DETAIL:
+                if capture_mode == "SINGLE":
+                    self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] RUN -> SINGLE")
+                else:
+                    self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] RUN")
             self.run_capture_once(scope, cycle_no, cycles)
+            idx = start_idx + n
+            if TEST_MODE:
+                csv_path, screenshot_path = self._write_test_capture_files(save_dir, idx, stage_idx, cycle_no)
+                saved_files.append(csv_path)
+                QApplication.processEvents()
+                continue
+
             _w(scope, scope.profile.acq_stop_cmd)
             time.sleep(0.25)
 
             csv_data = {}
             base_time = None
-            idx = start_idx + n
             csv_path = os.path.join(save_dir, make_filename(idx, self.selected_channels))
             screenshot_path = os.path.join(save_dir, make_screenshot_filename(idx, self.selected_channels))
             save_scope_screenshot(scope, screenshot_path)
-            self.append_status(
-                f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] 截屏完成: {screenshot_path}"
-            )
+            if LOG_CAPTURE_DETAIL:
+                self.append_status(
+                    f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] 截屏完成: {screenshot_path}"
+                )
 
             for ch in sorted(self.selected_channels):
                 self._check_task_control()
@@ -2853,17 +3207,25 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         raise RuntimeError(f"{ch} 的时间轴与其他通道不一致，已停止合并保存")
 
                 csv_data[ch] = v
-                self.append_status(
-                    f"[阶段{stage_idx}][循环{cycle_no}][{ch}] scope={meta['scope']} {meta['composition']} "
-                    f"width={meta['width']} dtype={meta['dtype']} BYT_OR={meta['byt_or']} "
-                    f"BN_FMT={meta['bn_fmt']} ENC={meta['data_enc']} N={meta['recl']}"
-                )
+                if LOG_CAPTURE_DETAIL:
+                    self.append_status(
+                        f"[阶段{stage_idx}][循环{cycle_no}][{ch}] scope={meta['scope']} {meta['composition']} "
+                        f"width={meta['width']} dtype={meta['dtype']} BYT_OR={meta['byt_or']} "
+                        f"BN_FMT={meta['bn_fmt']} ENC={meta['data_enc']} N={meta['recl']}"
+                    )
                 QApplication.processEvents()
 
             save_csv(csv_path, csv_data)
             saved_files.append(csv_path)
-            self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] SAVE完成: {csv_path}")
+            if LOG_CAPTURE_DETAIL:
+                self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] SAVE完成: {csv_path}")
             QApplication.processEvents()
+        first_idx = start_idx
+        last_idx = start_idx + cycles - 1
+        mode_text = "测试模式" if TEST_MODE else "示波器"
+        self.append_status(
+            f"[{mode_text}][阶段 {stage_idx}/{stage_total}] 采集完成: {cycles} 组，文件编号 T{first_idx:04d}-T{last_idx:04d}"
+        )
         return saved_files, start_idx + cycles
 
     def request_task_stop(self):
@@ -2979,6 +3341,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self.wait_light_source_stable()
                 stage_start_idx = start_idx
                 stage_end_target = stage_start_idx + cycles
+                self.append_status(
+                    f"[测量开始][阶段 {i}/{stage_total}] 循环={cycles}，模式={capture_mode}，"
+                    f"温度={t_txt}，压力={p_txt}，文件编号 T{stage_start_idx:04d}-T{stage_end_target - 1:04d}"
+                )
                 remaining = cycles
                 resume_attempts = 0
                 max_resume_attempts = 6
@@ -2989,7 +3355,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
                             reason=f"阶段 {i}/{stage_total} 采集前",
                             max_attempts=4,
                         )
-                        self.apply_acquire_settings(scope_stage)
+                        if not TEST_MODE:
+                            self.apply_acquire_settings(scope_stage)
                         _, start_idx = self._run_scope_cycles_for_stage(
                             scope_stage, save_dir, start_idx, remaining, i, stage_total
                         )
@@ -3073,6 +3440,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def _log_hotplate_send_commands(self, commands, baud=None, prefix="SEND"):
         """把标定台写命令写入活动日志。实时温压查询不走这个函数，所以不会刷屏。"""
+        if not LOG_HOTPLATE_COMMANDS:
+            return
         try:
             baud_text = "" if baud is None else f" @{baud}bps"
             for cmd in commands:
@@ -3089,6 +3458,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
             pass
 
     def _send_hotplate_commands(self, commands):
+        if TEST_MODE:
+            self._log_hotplate_send_commands(commands, baud="TEST")
+            return "TEST"
         if serial is None:
             raise RuntimeError("未安装 pyserial，请先执行: pip install pyserial")
         port = (self.hotplate_com_port or "").strip()
@@ -3128,6 +3500,23 @@ class MainWindow(LaserLifetimeCalibrationUI):
         raise RuntimeError(f"标定台命令发送失败: {port}\n" + "\n".join(errors))
 
     def _query_hotplate(self, command: str):
+        if TEST_MODE:
+            cmd = command.strip().upper()
+            if cmd == "*IDN?":
+                return "INSTEC,MK2000B,TEST_HOTPLATE,TEST", "TEST"
+            if "RTINFORMATION" in cmd:
+                temp_status = 2 if self.sim_temp_mode == "ramp" else 1
+                press_status = 2 if self.sim_press_mode == "ramp" else 1
+                resp = (
+                    f"MK:1:{self.sim_tf_current:.3f}:0:{self.sim_tf_target:.3f}:0:0:0:{temp_status}:0:0\r\n"
+                    f"MK:2:{self.sim_pf_current:.3f}:0:{self.sim_pf_target:.3f}:0:0:0:{press_status}:0:0"
+                )
+                return resp, "TEST"
+            if "STATUS" in cmd:
+                return "1", "TEST"
+            if "ERROR" in cmd:
+                return "0", "TEST"
+            return "OK", "TEST"
         if serial is None:
             raise RuntimeError("未安装 pyserial，请先执行: pip install pyserial")
         port = (self.hotplate_com_port or "").strip()
@@ -3285,7 +3674,16 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 return None, None
         return None, None
 
-    def wait_for_temp_press_stable(self, need_temp=None, need_press=None, reason: str = ""):
+    def wait_for_temp_press_stable(
+        self,
+        need_temp=None,
+        need_press=None,
+        reason: str = "",
+        temp_tol: float | None = None,
+        press_tol: float | None = None,
+        temp_hold_s: float | None = None,
+        press_hold_s: float | None = None,
+    ):
         if need_temp is None:
             need_temp = self.temp_cal_btn.isChecked()
         if need_press is None:
@@ -3295,10 +3693,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         temp_target = float(self.ref_temp_spin.value())
         press_target = float(self.ref_press_spin.value())
-        temp_tol = float(self.temp_fluc_spin.value())
-        press_tol = float(self.press_fluc_spin.value())
-        temp_hold_s = int(self.temp_stable_time_spin.value())
-        press_hold_s = int(self.press_stable_time_spin.value())
+        temp_tol = float(DEFAULT_TEMP_TOL if temp_tol is None else temp_tol)
+        press_tol = float(DEFAULT_PRESS_TOL if press_tol is None else press_tol)
+        temp_hold_s = float(DEFAULT_TEMP_HOLD_S if temp_hold_s is None else temp_hold_s)
+        press_hold_s = float(DEFAULT_PRESS_HOLD_S if press_hold_s is None else press_hold_s)
+        if TEST_MODE:
+            temp_hold_s = min(temp_hold_s, TEST_MAX_STABLE_HOLD_S)
+            press_hold_s = min(press_hold_s, TEST_MAX_STABLE_HOLD_S)
 
         temp_since = None
         press_since = None
@@ -3351,20 +3752,20 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 fields = []
                 if need_temp:
                     temp_prog = 0.0 if temp_since is None else max(0.0, now - temp_since)
-                    fields.append(f"温稳进度={temp_prog:.1f}/{temp_hold_s}s")
+                    fields.append(f"温稳进度={temp_prog:.1f}/{temp_hold_s:g}s")
                 if need_press:
                     press_prog = 0.0 if press_since is None else max(0.0, now - press_since)
-                    fields.append(f"压稳进度={press_prog:.1f}/{press_hold_s}s")
+                    fields.append(f"压稳进度={press_prog:.1f}/{press_hold_s:g}s")
                 self.append_data(", ".join(fields))
                 last_log_ts = now
 
             if temp_ok and press_ok:
                 if need_temp and need_press:
-                    self.append_status("[稳定等待] 温度、压力均已满足稳定时间，开始示波器保存流程")
+                    self.append_status("[稳定等待] 温度、压力已稳定")
                 elif need_temp:
-                    self.append_status("[稳定等待] 温度已满足稳定时间，开始示波器保存流程")
+                    self.append_status("[稳定等待] 温度已稳定")
                 else:
-                    self.append_status("[稳定等待] 压力已满足稳定时间，开始示波器保存流程")
+                    self.append_status("[稳定等待] 压力已稳定")
                 return
 
             QApplication.processEvents()
@@ -3384,10 +3785,12 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         target = self.ramp_target_temp
         diff = abs(tc_now - target)
+        tol = float(DEFAULT_TEMP_TOL if self.current_temp_tol is None else self.current_temp_tol)
+        hold_s = float(DEFAULT_TEMP_HOLD_S if self.current_temp_hold_s is None else self.current_temp_hold_s)
         now = time.time()
 
         if s_status == 2:
-            if diff <= TARGET_TOL_C:
+            if diff <= tol:
                 if self.reach_inband_since is None:
                     self.reach_inband_since = now
                 inband_sec = now - self.reach_inband_since
@@ -3395,16 +3798,16 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self.reach_inband_since = None
                 inband_sec = 0.0
 
-            if (not self.reach_confirmed) and inband_sec >= TARGET_HOLD_S:
+            if (not self.reach_confirmed) and inband_sec >= hold_s:
                 self.reach_confirmed = True
                 self.append_status(
-                    f"[标定台] RAMP达标: |TC-TF| <= {TARGET_TOL_C:.1f}℃ 持续 {TARGET_HOLD_S:.0f}s"
+                    f"[标定台] RAMP达标: |TC-TF| <= {tol:.3g}℃ 持续 {hold_s:g}s"
                 )
         elif s_status == 0 and not self.reach_confirmed:
             inband_sec = 0.0 if self.reach_inband_since is None else (now - self.reach_inband_since)
             self.append_status(
                 f"[标定台] WARN ramp stopped before reach-confirmed: tc={tc_now:.3f}, target={target:.3f}, "
-                f"diff={diff:.3f}, inband={inband_sec:.1f}/{TARGET_HOLD_S:.0f}s, tf={tf_rt}, tt={tt_rt}, err={err_code}"
+                f"diff={diff:.3f}, inband={inband_sec:.1f}/{hold_s:g}s, tf={tf_rt}, tt={tt_rt}, err={err_code}"
             )
 
     def _diagnose_hotplate_unexpected_stop(self, axis: str = "温度"):
@@ -3435,12 +3838,6 @@ class MainWindow(LaserLifetimeCalibrationUI):
             rt_resp, baud = self._query_hotplate("TEMPerature:RTINformation?")
             tc, _, tf_rt, tt_rt, s_status, err_code = self._extract_rt_channels(rt_resp, self.control_slave)
             self._update_reach_judge(tc, s_status, tf_rt=tf_rt, tt_rt=tt_rt, err_code=err_code)
-
-            if s_status != self.last_hotplate_s_status:
-                self.append_status(
-                    f"[标定台] STATE s_status changed: {self.last_hotplate_s_status} -> {s_status} "
-                    "(0-stop,1-hold,2-ramp)"
-                )
 
             if (
                 self.last_hotplate_s_status == 2
@@ -3475,11 +3872,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         target = self.press_ramp_target
         try:
-            tol = float(self.press_fluc_spin.value())
+            tol = float(DEFAULT_PRESS_TOL if self.current_press_tol is None else self.current_press_tol)
         except Exception:
             tol = max(0.5, abs(target) * 0.001)
         try:
-            hold_s = float(self.press_stable_time_spin.value())
+            hold_s = float(
+                DEFAULT_PRESS_HOLD_S if self.current_press_hold_s is None else self.current_press_hold_s
+            )
         except Exception:
             hold_s = TARGET_HOLD_S
 
@@ -3541,12 +3940,6 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 _, pk = self._extract_temp_pressure_fallback(rt_resp)
             self._update_press_reach_judge(pk, s_status, pf_rt=pf_rt, tt_rt=tt_rt, err_code=err_code)
 
-            if s_status != self.last_hotplate_press_s_status:
-                self.append_status(
-                    f"[标定台] P-STATE s_status changed: {self.last_hotplate_press_s_status} -> {s_status} "
-                    "(0-stop,1-hold,2-ramp)"
-                )
-
             if s_status == 0 and not self.press_reach_confirmed:
                 self.append_status(
                     f"[标定台] 警告: P-RAMP在未达标时停止/卡住 [{baud}bps], rt={rt_resp!r}"
@@ -3562,147 +3955,6 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         except Exception as ex:
             self.append_status(f"[标定台] 压力监控查询失败: {ex}")
-
-    def send_hotplate_hold(self):
-        tf = float(self.hotplate_tf_spin.value())
-        try:
-            self._send_hotplate_commands(
-                [
-                    f"TEMPerature:OPSLave {self.control_slave}",
-                    f"TEMPerature:HOLD {tf}",
-                ]
-            )
-            self.sim_tf_target = tf
-            self.sim_tf_current = tf
-            self.sim_rate_cpm = 0.0
-            self.sim_temp_mode = "hold"
-            self._reset_ramp_guard_state()
-            self.append_status(f"[标定台] HOLD 已发送: TF={tf:.2f} ℃")
-        except Exception as ex:
-            QMessageBox.critical(self, "标定台控制失败", str(ex))
-
-    def send_hotplate_ramp(self):
-        tf = float(self.hotplate_tf_spin.value())
-        rate = float(self.hotplate_rate_spin.value())
-        if rate <= 0:
-            QMessageBox.warning(self, "标定台参数错误", "Rate 必须大于 0")
-            return
-        if rate > MAX_RAMP_RATE:
-            QMessageBox.warning(
-                self,
-                "标定台参数错误",
-                self._rate_limit_message("升温速率", rate, "℃/min"),
-            )
-            return
-        try:
-            self._send_hotplate_commands(
-                [
-                    f"TEMPerature:OPSLave {self.control_slave}",
-                    f"TEMPerature:RAMP {tf},{rate}",
-                ]
-            )
-            self.ramp_target_temp = tf
-            self.ramp_rate_cpm = rate
-            self.reach_inband_since = None
-            self.reach_confirmed = False
-            self.last_hotplate_s_status = None
-            base_tc = self.last_live_tc if self.last_live_tc is not None else self.sim_tf_current
-            self.sim_tf_target = tf
-            self.sim_tf_current = base_tc
-            self.sim_rate_cpm = abs(rate)
-            self.sim_temp_mode = "ramp"
-            self.hotplate_guard_timer.start()
-            self.append_status(
-                f"[标定台] RAMP 已发送: TF={tf:.2f} ℃, Rate={rate:.2f} ℃/min"
-            )
-        except Exception as ex:
-            QMessageBox.critical(self, "标定台控制失败", str(ex))
-
-    def send_hotplate_stop(self):
-        try:
-            self._send_hotplate_commands(
-                [
-                    f"TEMPerature:OPSLave {self.control_slave}",
-                    "TEMPerature:STOP",
-                ]
-            )
-            self.sim_temp_mode = "hold"
-            self.sim_rate_cpm = 0.0
-            self.sim_tf_target = self.sim_tf_current
-            self._reset_ramp_guard_state()
-            self.append_status("[标定台] STOP 已发送")
-        except Exception as ex:
-            QMessageBox.critical(self, "标定台控制失败", str(ex))
-
-    def send_hotplate_press_hold(self):
-        pf = float(self.hotplate_pf_spin.value())
-        try:
-            self._send_hotplate_commands(
-                [
-                    f"TEMPerature:OPSLave {self.press_control_slave}",
-                    f"TEMPerature:HOLD {pf}",
-                ]
-            )
-            self.sim_pf_target = pf
-            self.sim_pf_current = pf
-            self.sim_prate_kpm = 0.0
-            self.sim_press_mode = "hold"
-            self._reset_press_ramp_guard_state()
-            self.append_status(f"[标定台] P-HOLD 已发送: PF={pf:.2f} kPa")
-        except Exception as ex:
-            QMessageBox.critical(self, "压力控制失败", str(ex))
-
-    def send_hotplate_press_ramp(self):
-        pf = float(self.hotplate_pf_spin.value())
-        prate = float(self.hotplate_prate_spin.value())
-        if prate <= 0:
-            QMessageBox.warning(self, "压力参数错误", "P-Rate 必须大于 0")
-            return
-        if prate > MAX_RAMP_RATE:
-            QMessageBox.warning(
-                self,
-                "压力参数错误",
-                self._rate_limit_message("升压速率", prate, "kPa/min"),
-            )
-            return
-        try:
-            self._send_hotplate_commands(
-                [
-                    f"TEMPerature:OPSLave {self.press_control_slave}",
-                    f"TEMPerature:RAMP {pf},{prate}",
-                ]
-            )
-            self.press_ramp_target = pf
-            self.press_ramp_rate_kpm = prate
-            self.press_reach_inband_since = None
-            self.press_reach_confirmed = False
-            self.last_hotplate_press_s_status = None
-            self.press_guard_last_restart_ts = 0.0
-            base_pk = self.last_live_pk if self.last_live_pk is not None else self.sim_pf_current
-            self.sim_pf_target = pf
-            self.sim_pf_current = base_pk
-            self.sim_prate_kpm = abs(prate)
-            self.sim_press_mode = "ramp"
-            self.hotplate_press_guard_timer.start()
-            self.append_status(f"[标定台] P-RAMP 已发送: PF={pf:.2f} kPa, P-Rate={prate:.2f} kPa/min")
-        except Exception as ex:
-            QMessageBox.critical(self, "压力控制失败", str(ex))
-
-    def send_hotplate_press_stop(self):
-        try:
-            self._send_hotplate_commands(
-                [
-                    f"TEMPerature:OPSLave {self.press_control_slave}",
-                    "TEMPerature:STOP",
-                ]
-            )
-            self.sim_press_mode = "hold"
-            self.sim_prate_kpm = 0.0
-            self.sim_pf_target = self.sim_pf_current
-            self._reset_press_ramp_guard_state()
-            self.append_status("[标定台] P-STOP 已发送")
-        except Exception as ex:
-            QMessageBox.critical(self, "压力控制失败", str(ex))
 
 
 def main():
