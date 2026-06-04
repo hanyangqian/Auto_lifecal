@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QMessageBox,
     QComboBox,
+    QLineEdit,
     QGridLayout,
     QLabel,
     QHBoxLayout,
@@ -72,7 +73,8 @@ TEST_CAPTURE_POINTS = 1000
 LOG_HOTPLATE_COMMANDS = False
 LOG_CAPTURE_DETAIL = False
 LOG_STAGE_DETAIL_LIMIT = 4
-FNAME_RE = re.compile(r"^T(\d+)(?:[_-]?(CH[1-4](?:CH[1-4])*))?\.CSV$", re.IGNORECASE)
+CURRENT_SCOPE_SAVE_FORMAT = "CSV"
+FNAME_RE = re.compile(r"^T(\d+)(?:[_-]?(CH[1-4](?:CH[1-4])*))?\.(?:CSV|NPZ)$", re.IGNORECASE)
 TEST_PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xff\xff?"
@@ -240,6 +242,15 @@ def _resource_priority(resource: str):
     return 4
 
 
+def build_tcpip_resource(address_or_resource: str) -> str:
+    text = (address_or_resource or "").strip()
+    if not text:
+        return ""
+    if "::" in text:
+        return text
+    return f"TCPIP0::{text}::inst0::INSTR"
+
+
 def _probe_scope_identity(rm, resource: str):
     scope = None
     try:
@@ -265,31 +276,36 @@ def _probe_scope_identity(rm, resource: str):
                 pass
 
 
-def discover_scope_resource_robust(serial_lock: str, cached_resource: str = ""):
+def discover_scope_resource_robust(serial_lock: str, cached_resource: str = "", manual_resource: str = ""):
     rm = pyvisa.ResourceManager()
     try:
         resources = list(rm.list_resources())
-        if not resources:
-            raise RuntimeError("未发现任何 VISA 资源，请确认示波器已连接并安装 NI-VISA。")
-
         usb_resources = [
             r for r in resources
             if r.upper().startswith("USB") and "::INSTR" in r.upper()
         ]
-        if not usb_resources:
-            raise RuntimeError("未发现 USB VISA 资源。当前可见资源：\n" + "\n".join(resources))
+        tcpip_resources = [r for r in resources if r.upper().startswith("TCPIP")]
 
         search_order = []
-        if cached_resource and cached_resource in usb_resources:
+        manual_resource = build_tcpip_resource(manual_resource)
+        if manual_resource:
+            search_order.append(manual_resource)
+        if cached_resource and cached_resource not in search_order:
             search_order.append(cached_resource)
         if serial_lock:
             for r in usb_resources:
                 if serial_lock.upper() in r.upper() and r not in search_order:
                     search_order.append(r)
         tek_usb = [r for r in usb_resources if "0X0699" in r.upper() or "0699" in r.upper()]
-        for r in tek_usb + usb_resources:
+        for r in tek_usb + usb_resources + tcpip_resources:
             if r not in search_order:
                 search_order.append(r)
+
+        if not search_order:
+            raise RuntimeError(
+                "未发现任何可尝试的 VISA 资源。请确认示波器已开机、NI-VISA 已安装，"
+                "或在初始化窗口填写示波器 IP / VISA 资源。"
+            )
 
         matches = []
         probe_errors = []
@@ -333,7 +349,9 @@ def discover_scope_resource_robust(serial_lock: str, cached_resource: str = ""):
         error_text = "\n".join(probe_errors[:12]) if probe_errors else "(无可用探测结果)"
         raise RuntimeError(
             "未找到支持的 Tek 示波器。当前 USB 资源：\n"
-            + "\n".join(usb_resources)
+            + ("\n".join(usb_resources) if usb_resources else "(无)")
+            + "\n\n当前 TCPIP 资源：\n"
+            + ("\n".join(tcpip_resources) if tcpip_resources else "(无)")
             + "\n\n探测结果：\n"
             + error_text
         )
@@ -691,9 +709,17 @@ def next_index(save_dir: str) -> int:
     return max_idx + 1
 
 
-def make_filename(idx: int, channels):
+def normalize_save_format(save_format):
+    fmt = str(save_format or "CSV").strip().upper()
+    if fmt not in {"CSV", "NPZ"}:
+        return "CSV"
+    return fmt
+
+
+def make_filename(idx: int, channels, save_format=None):
     suffix = "".join(sorted(channels))
-    return f"T{idx:04d}{suffix}.CSV"
+    ext = normalize_save_format(save_format or CURRENT_SCOPE_SAVE_FORMAT)
+    return f"T{idx:04d}{suffix}.{ext}"
 
 
 def make_screenshot_filename(idx: int, channels):
@@ -701,8 +727,63 @@ def make_screenshot_filename(idx: int, channels):
     return f"{name}.PNG"
 
 
+def make_available_capture_paths(save_dir: str, start_idx: int, channels, save_format="CSV"):
+    idx = start_idx
+    while True:
+        waveform_name = make_filename(idx, channels, save_format)
+        screenshot_name = make_screenshot_filename(idx, channels)
+        waveform_path = os.path.join(save_dir, waveform_name)
+        screenshot_path = os.path.join(save_dir, screenshot_name)
+        if not os.path.exists(waveform_path) and not os.path.exists(screenshot_path):
+            return idx, waveform_path, screenshot_path
+        idx += 1
+
+
+def _next_non_existing_capture_path(save_path: str) -> str:
+    if not os.path.exists(save_path):
+        return save_path
+    folder = os.path.dirname(save_path) or "."
+    filename = os.path.basename(save_path)
+    match = FNAME_RE.match(filename)
+    if match:
+        channels = match.group(2) or ""
+        ext = os.path.splitext(filename)[1].lstrip(".").upper()
+        idx = next_index(folder)
+        while True:
+            candidate = os.path.join(folder, f"T{idx:04d}{channels}.{ext}")
+            if not os.path.exists(candidate):
+                return candidate
+            idx += 1
+
+    stem, ext = os.path.splitext(filename)
+    idx = 1
+    while True:
+        candidate = os.path.join(folder, f"{stem}_{idx}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
+
+
 def save_csv(save_path: str, data: dict):
-    pd.DataFrame(data).to_csv(save_path, index=False)
+    if os.path.splitext(save_path)[1].lower() == ".npz":
+        save_npz(save_path, data)
+        return
+    pd.DataFrame(data).to_csv(_next_non_existing_capture_path(save_path), index=False)
+
+
+def save_npz(save_path: str, data: dict, meta=None):
+    save_path = _next_non_existing_capture_path(save_path)
+    arrays = {name: np.asarray(values) for name, values in data.items()}
+    if meta is not None:
+        arrays["__meta_json__"] = np.asarray(json.dumps(meta, ensure_ascii=False, indent=2))
+    np.savez(save_path, **arrays)
+
+
+def save_waveform_file(save_path: str, data: dict, save_format="CSV", meta=None):
+    if normalize_save_format(save_format) == "NPZ":
+        save_npz(save_path, data, meta=meta)
+    else:
+        save_csv(save_path, data)
 
 
 def _extract_scpi_block_payload(raw: bytes) -> bytes:
@@ -722,6 +803,7 @@ def _extract_scpi_block_payload(raw: bytes) -> bytes:
 
 
 def save_scope_screenshot(scope, save_path: str):
+    save_path = _next_non_existing_capture_path(save_path)
     old_timeout = scope.timeout
     try:
         _w(scope, "SAVe:IMAGe:FILEFormat PNG")
@@ -808,6 +890,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.info_fit_window = None
         self.siggen_com_port = ""
         self.siggen_channels = {"CH1"}
+        self.scope_manual_resource = ""
 
         self.channel_btn = QPushButton()
         self._update_channel_button_text()
@@ -845,6 +928,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.avg_checkbox.toggled.connect(self.on_avg_toggled)
         self.single_mode_btn.toggled.connect(self.on_capture_mode_toggled)
         self.avg_count_combo.currentIndexChanged.connect(self.on_avg_count_changed)
+        self.save_format_combo.currentIndexChanged.connect(self.on_save_format_changed)
         self.fit_settings_btn.clicked.connect(self.open_lifetime_fit_settings)
         self.fit_enable_btn.toggled.connect(self.on_fit_enable_toggled)
         self.temp_custom_edit_btn.clicked.connect(self.edit_custom_axis_path)
@@ -854,46 +938,19 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.load_port_settings()
         self.load_saved_path()
         self.load_fit_enable_setting()
+        self.load_save_format_setting()
         self.load_custom_axis_settings()
         self.update_path_summary()
-        self._install_stage_control_order_ui()
-        self.load_stage_control_order_setting()
         self.settings_button.hide()
         self.test_mode_label.setVisible(TEST_MODE)
         self._ui_init_done = True
         self.append_status("[系统] 已加载主窗口")
 
-    def _install_stage_control_order_ui(self):
-        combo = getattr(self, "stage_control_order_combo", None)
-        if combo is None:
-            return
-        if not getattr(self, "_stage_control_order_connected", False):
-            combo.currentIndexChanged.connect(self.on_stage_control_order_changed)
-            self._stage_control_order_connected = True
-
-    def load_stage_control_order_setting(self):
-        # 使用新的 key，避免旧版本错误默认值“同步控温控压（原逻辑）”继续残留。
-        order = self.settings.value("stage_control_order_v2", "TEMP_THEN_PRESS", type=str)
-        combo = getattr(self, "stage_control_order_combo", None)
-        if combo is None:
-            return
-        idx = combo.findData(order)
-        combo.setCurrentIndex(idx if idx >= 0 else 0)
-
-    def on_stage_control_order_changed(self):
-        combo = getattr(self, "stage_control_order_combo", None)
-        if combo is None:
-            return
-        order = combo.currentData() or "TEMP_THEN_PRESS"
-        self.settings.setValue("stage_control_order_v2", order)
-        if getattr(self, "_ui_init_done", False):
-            self.append_status(f"[阶段] 温压执行顺序: {combo.currentText()}")
-
     def _stage_control_order(self) -> str:
-        combo = getattr(self, "stage_control_order_combo", None)
-        if combo is None:
+        order = self.settings.value("stage_control_order_v2", "TEMP_THEN_PRESS", type=str)
+        if order not in ("TEMP_THEN_PRESS", "PRESS_THEN_TEMP"):
             return "TEMP_THEN_PRESS"
-        return str(combo.currentData() or "TEMP_THEN_PRESS")
+        return str(order)
 
     @staticmethod
     def _format_condition_value(value, unit: str) -> str:
@@ -1375,6 +1432,22 @@ class MainWindow(LaserLifetimeCalibrationUI):
         enable_row.insertWidget(0, enable_hint)
         outer_layout.addLayout(enable_row)
 
+        order_row = QHBoxLayout()
+        order_label = QLabel("执行顺序:")
+        order_combo = QComboBox(dialog)
+        order_combo.addItem("先控温，温度稳定后再控压", "TEMP_THEN_PRESS")
+        order_combo.addItem("先控压，压力稳定后再控温", "PRESS_THEN_TEMP")
+        order_combo.setToolTip(
+            "控制温度和压力都启用时的执行顺序。\n"
+            "单独启用温度或压力时，此设置不会影响运行。"
+        )
+        current_order = self._stage_control_order()
+        order_idx = order_combo.findData(current_order)
+        order_combo.setCurrentIndex(order_idx if order_idx >= 0 else 0)
+        order_row.addWidget(order_label)
+        order_row.addWidget(order_combo, 1)
+        outer_layout.addLayout(order_row)
+
         layout = QHBoxLayout()
         outer_layout.addLayout(layout, 1)
 
@@ -1553,6 +1626,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         self.temp_cal_btn.setChecked(temp_enable_btn.isChecked())
         self.press_cal_btn.setChecked(press_enable_btn.isChecked())
+        selected_order = str(order_combo.currentData() or "TEMP_THEN_PRESS")
+        if selected_order != current_order:
+            self.settings.setValue("stage_control_order_v2", selected_order)
+            self.append_status(f"[阶段] 温压执行顺序: {order_combo.currentText()}")
 
         summaries = []
         for axis, segments in segments_by_axis.items():
@@ -1659,6 +1736,24 @@ class MainWindow(LaserLifetimeCalibrationUI):
         enabled = self.settings.value("fit_after_run_enabled", True, type=bool)
         self.fit_enable_btn.setChecked(bool(enabled))
 
+    def load_save_format_setting(self):
+        global CURRENT_SCOPE_SAVE_FORMAT
+        fmt = normalize_save_format(self.settings.value("scope_save_format", "CSV", type=str))
+        CURRENT_SCOPE_SAVE_FORMAT = fmt
+        idx = self.save_format_combo.findData(fmt)
+        self.save_format_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def get_save_format(self) -> str:
+        return normalize_save_format(self.save_format_combo.currentData() or CURRENT_SCOPE_SAVE_FORMAT)
+
+    def on_save_format_changed(self):
+        global CURRENT_SCOPE_SAVE_FORMAT
+        fmt = self.get_save_format()
+        CURRENT_SCOPE_SAVE_FORMAT = fmt
+        self.settings.setValue("scope_save_format", fmt)
+        if getattr(self, "_ui_init_done", False):
+            self.append_status(f"[示波器] 保存格式: {fmt}")
+
     def load_custom_axis_settings(self):
         self.temp_cal_btn.setChecked(self.settings.value("temp_axis_enabled", True, type=bool))
         self.press_cal_btn.setChecked(self.settings.value("press_axis_enabled", False, type=bool))
@@ -1691,11 +1786,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def load_port_settings(self):
         saved_scope = self.settings.value("scope_com_port", "", type=str).strip()
+        saved_scope_resource = self.settings.value("scope_manual_resource", "", type=str).strip()
         saved_hotplate = self.settings.value("hotplate_com_port", "", type=str).strip()
         saved_siggen = self.settings.value("siggen_com_port", "", type=str).strip()
         saved_siggen_channels = self.settings.value("siggen_channels", "CH1", type=str).strip()
         if saved_scope:
             self.scope_com_port = saved_scope
+        self.scope_manual_resource = saved_scope_resource
         if saved_hotplate:
             self.hotplate_com_port = saved_hotplate
         if saved_siggen:
@@ -1712,6 +1809,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.settings.setValue("scope_com_port", scope_port)
         else:
             self.settings.remove("scope_com_port")
+        scope_resource = (self.scope_manual_resource or "").strip()
+        if scope_resource:
+            self.settings.setValue("scope_manual_resource", scope_resource)
+        else:
+            self.settings.remove("scope_manual_resource")
         if hotplate_port:
             self.settings.setValue("hotplate_com_port", hotplate_port)
         else:
@@ -1745,9 +1847,11 @@ class MainWindow(LaserLifetimeCalibrationUI):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(10)
 
-        grid.addWidget(QLabel("示波器 COM口:"), 0, 0)
-        scope_combo = QComboBox()
-        grid.addWidget(scope_combo, 0, 1)
+        grid.addWidget(QLabel("示波器 IP / VISA:"), 0, 0)
+        scope_resource_edit = QLineEdit()
+        scope_resource_edit.setPlaceholderText("留空自动检测，或输入 10.5.5.88 / TCPIP0::...::INSTR")
+        scope_resource_edit.setText(self.scope_manual_resource)
+        grid.addWidget(scope_resource_edit, 0, 1)
 
         grid.addWidget(QLabel("标定台 COM口:"), 1, 0)
         hotplate_combo = QComboBox()
@@ -1765,7 +1869,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         siggen_ch_row.addWidget(siggen_ch2)
         grid.addLayout(siggen_ch_row, 3, 1)
 
-        status_label = QLabel("可手动选择，也可自动检测(100ms/端口询问)")
+        status_label = QLabel("示波器留空时自动检测 USB/TCPIP；COM 设备可自动检测")
         grid.addWidget(status_label, 4, 0, 1, 2)
         layout.addLayout(grid)
 
@@ -1777,11 +1881,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
         layout.addLayout(tools_layout)
 
         def fill_port_combos():
-            scope_combo.clear()
             hotplate_combo.clear()
             siggen_combo.clear()
             for label, value in self.get_available_com_ports():
-                scope_combo.addItem(label, value)
                 hotplate_combo.addItem(label, value)
                 siggen_combo.addItem(label, value)
 
@@ -1793,7 +1895,6 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     combo.addItem(f"{current_value} (当前)", current_value)
                     combo.setCurrentIndex(combo.count() - 1)
 
-            ensure_current(scope_combo, self.scope_com_port)
             ensure_current(hotplate_combo, self.hotplate_com_port)
             ensure_current(siggen_combo, self.siggen_com_port)
             siggen_ch1.setChecked("CH1" in self.siggen_channels)
@@ -1801,15 +1902,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         def on_detect_done(result):
             auto_btn.setEnabled(True)
-            scope_val = result.get("scope_com")
             hotplate_val = result.get("hotplate_com")
             siggen_val = result.get("siggen_com")
-            if scope_val:
-                idx = scope_combo.findData(scope_val)
-                if idx < 0:
-                    scope_combo.addItem(f"{scope_val} (自动检测)", scope_val)
-                    idx = scope_combo.count() - 1
-                scope_combo.setCurrentIndex(idx)
             if hotplate_val:
                 idx = hotplate_combo.findData(hotplate_val)
                 if idx < 0:
@@ -1852,7 +1946,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if dialog.exec_() != QDialog.Accepted:
             return
 
-        self.scope_com_port = scope_combo.currentData() or self.scope_com_port
+        self.scope_manual_resource = scope_resource_edit.text().strip()
         self.hotplate_com_port = hotplate_combo.currentData() or self.hotplate_com_port
         self.siggen_com_port = siggen_combo.currentData() or self.siggen_com_port
         channels = set()
@@ -1876,7 +1970,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             f"[初始化] 标定台: 端口={self.hotplate_com_port}, SN={hot_sn}, 连接={'是' if hot_ok else '否'}"
         )
         self.append_status(
-            f"[初始化] 示波器: 端口={self.scope_com_port}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
+            f"[初始化] 示波器: 资源={self.resource_str or self.scope_manual_resource or '自动'}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
         )
         self.append_status(
             f"[初始化] 信号发生器: 端口={self.siggen_com_port or '未配置'}, 状态={sig_sn}, 连接={'是' if sig_ok else '否'}, 通道={','.join(sorted(self.siggen_channels)) or '无'}"
@@ -1910,7 +2004,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             f"[自动初始化] 标定台: 端口={self.hotplate_com_port}, SN={hot_sn}, 连接={'是' if hot_ok else '否'}"
         )
         self.append_status(
-            f"[自动初始化] 示波器: 端口={self.scope_com_port}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
+            f"[自动初始化] 示波器: 资源={self.resource_str or self.scope_manual_resource or '自动'}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
         )
         self.append_status(
             f"[自动初始化] 信号发生器: 端口={self.siggen_com_port or '未配置'}, 状态={sig_sn}, 连接={'是' if sig_ok else '否'}, 通道={','.join(sorted(self.siggen_channels)) or '无'}"
@@ -2500,21 +2594,27 @@ class MainWindow(LaserLifetimeCalibrationUI):
         raise RuntimeError(f"第 {cycle_idx} 次循环等待 SINGLE 完成超时")
 
     def _write_test_capture_files(self, save_dir: str, idx: int, stage_idx: int, cycle_no: int):
-        csv_data = {}
+        save_format = self.get_save_format()
+        waveform_data = {}
         t = np.linspace(0.0, 1.0, TEST_CAPTURE_POINTS)
-        csv_data["TIME"] = t
+        waveform_data["TIME"] = t
         for ch_index, ch in enumerate(sorted(self.selected_channels), start=1):
             freq = 4.0 + ch_index
             phase = stage_idx * 0.2 + cycle_no * 0.1
             baseline = 0.05 * stage_idx
-            csv_data[ch] = baseline + np.sin(2 * np.pi * freq * t + phase) * np.exp(-2.5 * t)
+            waveform_data[ch] = baseline + np.sin(2 * np.pi * freq * t + phase) * np.exp(-2.5 * t)
 
-        csv_path = os.path.join(save_dir, make_filename(idx, self.selected_channels))
+        save_path = os.path.join(save_dir, make_filename(idx, self.selected_channels, save_format))
         screenshot_path = os.path.join(save_dir, make_screenshot_filename(idx, self.selected_channels))
-        save_csv(csv_path, csv_data)
+        save_waveform_file(
+            save_path,
+            waveform_data,
+            save_format=save_format,
+            meta={"mode": "TEST", "stage_idx": stage_idx, "cycle_no": cycle_no},
+        )
         with open(screenshot_path, "wb") as f:
             f.write(TEST_PNG_BYTES)
-        return csv_path, screenshot_path
+        return save_path, screenshot_path
 
     def with_scope(self):
         if not self.resource_str:
@@ -2615,18 +2715,23 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         try:
             cached_resource = self.settings.value("scope_resource_str", "", type=str)
-            device_info = discover_scope_resource_robust(SERIAL_LOCK, cached_resource=cached_resource)
+            manual_resource = getattr(self, "scope_manual_resource", "")
+            device_info = discover_scope_resource_robust(
+                SERIAL_LOCK,
+                cached_resource=cached_resource,
+                manual_resource=manual_resource,
+            )
             self.resource_str = device_info["resource"]
             self.idn = device_info["idn"].strip()
             self.profile_name = device_info["profile"].name
             self.settings.setValue("scope_resource_str", self.resource_str)
+            parts = [x.strip() for x in self.idn.split(",")]
+            sn = parts[2] if len(parts) > 2 and parts[2] else self.idn
             if verbose:
-                self.append_status(f"[示波器] 已锁定 [{SERIAL_LOCK}]")
+                self.append_status(f"[示波器] 已锁定 [{sn}]")
                 self.append_status(f"[示波器] 型号: {self.profile_name}")
                 self.append_status(f"[示波器] 资源: {self.resource_str}")
                 self.append_status(f"[示波器] IDN: {self.idn}")
-            parts = [x.strip() for x in self.idn.split(",")]
-            sn = parts[2] if len(parts) > 2 and parts[2] else self.idn
             return True, sn
         except Exception as e:
             self.settings.remove("scope_resource_str")
@@ -2636,7 +2741,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             if verbose:
                 self.append_status(f"[示波器] 未连接或锁定失败: {e}")
             if show_error:
-                QMessageBox.critical(self, "连接失败", f"无法锁定示波器（序列号 {SERIAL_LOCK}）\n\n{e}")
+                QMessageBox.critical(self, "连接失败", f"无法锁定示波器\n\n{e}")
             return False, "未连接"
 
     @staticmethod
@@ -3166,6 +3271,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def _run_scope_cycles_for_stage(self, scope, save_dir: str, start_idx: int, cycles: int, stage_idx: int, stage_total: int):
         capture_mode = self.get_capture_mode()
+        save_format = self.get_save_format()
         saved_files = []
         for n in range(cycles):
             self._check_task_control()
@@ -3178,17 +3284,25 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.run_capture_once(scope, cycle_no, cycles)
             idx = start_idx + n
             if TEST_MODE:
-                csv_path, screenshot_path = self._write_test_capture_files(save_dir, idx, stage_idx, cycle_no)
-                saved_files.append(csv_path)
+                save_path, screenshot_path = self._write_test_capture_files(save_dir, idx, stage_idx, cycle_no)
+                saved_files.append(save_path)
                 QApplication.processEvents()
                 continue
 
             _w(scope, scope.profile.acq_stop_cmd)
             time.sleep(0.25)
 
-            csv_data = {}
+            waveform_data = {}
+            waveform_meta = {
+                "format": save_format,
+                "stage_idx": stage_idx,
+                "stage_total": stage_total,
+                "cycle_no": cycle_no,
+                "channels": sorted(self.selected_channels),
+                "scope": getattr(scope.profile, "name", ""),
+            }
             base_time = None
-            csv_path = os.path.join(save_dir, make_filename(idx, self.selected_channels))
+            save_path = os.path.join(save_dir, make_filename(idx, self.selected_channels, save_format))
             screenshot_path = os.path.join(save_dir, make_screenshot_filename(idx, self.selected_channels))
             save_scope_screenshot(scope, screenshot_path)
             if LOG_CAPTURE_DETAIL:
@@ -3201,12 +3315,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 t, v, meta = read_waveform(scope, ch)
                 if base_time is None:
                     base_time = t
-                    csv_data["TIME"] = t
+                    waveform_data["TIME"] = t
                 else:
                     if len(t) != len(base_time) or not np.allclose(t, base_time, rtol=0.0, atol=1e-15):
                         raise RuntimeError(f"{ch} 的时间轴与其他通道不一致，已停止合并保存")
 
-                csv_data[ch] = v
+                waveform_data[ch] = v
+                waveform_meta[ch] = meta
                 if LOG_CAPTURE_DETAIL:
                     self.append_status(
                         f"[阶段{stage_idx}][循环{cycle_no}][{ch}] scope={meta['scope']} {meta['composition']} "
@@ -3215,10 +3330,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     )
                 QApplication.processEvents()
 
-            save_csv(csv_path, csv_data)
-            saved_files.append(csv_path)
+            save_waveform_file(save_path, waveform_data, save_format=save_format, meta=waveform_meta)
+            saved_files.append(save_path)
             if LOG_CAPTURE_DETAIL:
-                self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] SAVE完成: {csv_path}")
+                self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] SAVE完成: {save_path}")
             QApplication.processEvents()
         first_idx = start_idx
         last_idx = start_idx + cycles - 1
@@ -3317,8 +3432,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
             start_idx = next_index(save_dir)
 
             capture_mode = self.get_capture_mode()
+            save_format = self.get_save_format()
             self.append_status(
-                f"[任务] 自动流程启动: 阶段数={len(stages)}, 每阶段循环={cycles}, 模式={capture_mode}"
+                f"[任务] 自动流程启动: 阶段数={len(stages)}, 每阶段循环={cycles}, 模式={capture_mode}, 保存格式={save_format}"
             )
 
             saved_files = []
@@ -3393,7 +3509,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         )
 
                 stage_files = [
-                    os.path.join(save_dir, make_filename(idx, self.selected_channels))
+                    os.path.join(save_dir, make_filename(idx, self.selected_channels, save_format))
                     for idx in range(stage_start_idx, min(start_idx, stage_end_target))
                 ]
                 saved_files.extend(stage_files)

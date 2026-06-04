@@ -248,7 +248,8 @@ class LaserLifetimeCalibrationUI(QWidget):
         self.fit_enable_btn.setText("拟合开启" if checked else "拟合关闭")
 
     def update_settings_tooltip(self):
-        self.settings_button.setToolTip(f"示波器: {self.scope_com_port} | 标定台: {self.hotplate_com_port}")
+        scope_text = getattr(self, "scope_manual_resource", "") or self.scope_com_port
+        self.settings_button.setToolTip(f"示波器: {scope_text or '自动'} | 标定台: {self.hotplate_com_port}")
 
     def get_available_com_ports(self):
         if list_ports is None:
@@ -275,9 +276,11 @@ class LaserLifetimeCalibrationUI(QWidget):
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(10)
 
-        form.addWidget(QLabel("示波器 COM口:"), 0, 0)
-        scope_combo = QComboBox()
-        form.addWidget(scope_combo, 0, 1)
+        form.addWidget(QLabel("示波器 IP / VISA:"), 0, 0)
+        scope_resource_edit = QLineEdit()
+        scope_resource_edit.setPlaceholderText("留空自动检测，或输入 10.5.5.88 / TCPIP0::...::INSTR")
+        scope_resource_edit.setText(getattr(self, "scope_manual_resource", ""))
+        form.addWidget(scope_resource_edit, 0, 1)
 
         form.addWidget(QLabel("标定台 COM口:"), 1, 0)
         hotplate_combo = QComboBox()
@@ -285,17 +288,12 @@ class LaserLifetimeCalibrationUI(QWidget):
 
         port_items = self.get_available_com_ports()
         if not port_items:
-            for fallback in [self.scope_com_port, self.hotplate_com_port]:
+            for fallback in [self.hotplate_com_port]:
                 if fallback and fallback not in [item[1] for item in port_items]:
                     port_items.append((f"{fallback} (当前配置)", fallback))
 
         for label, value in port_items:
-            scope_combo.addItem(label, value)
             hotplate_combo.addItem(label, value)
-
-        scope_idx = scope_combo.findData(self.scope_com_port)
-        if scope_idx >= 0:
-            scope_combo.setCurrentIndex(scope_idx)
 
         hotplate_idx = hotplate_combo.findData(self.hotplate_com_port)
         if hotplate_idx >= 0:
@@ -312,7 +310,7 @@ class LaserLifetimeCalibrationUI(QWidget):
             QMessageBox.information(self, "提示", "未安装 pyserial，无法读取本机真实串口。\n请先安装: pip install pyserial")
 
         if dialog.exec_() == QDialog.Accepted:
-            self.scope_com_port = scope_combo.currentData() or self.scope_com_port
+            self.scope_manual_resource = scope_resource_edit.text().strip()
             self.hotplate_com_port = hotplate_combo.currentData() or self.hotplate_com_port
             self.update_settings_tooltip()
 
@@ -407,23 +405,13 @@ class LaserLifetimeCalibrationUI(QWidget):
         left_grid.setColumnStretch(5, 1)
 
         row = 0
-        left_grid.addWidget(QLabel("温压顺序:"), row, 0)
-        self.stage_control_order_combo = QComboBox()
-        self.stage_control_order_combo.addItem("温-压", "TEMP_THEN_PRESS")
-        self.stage_control_order_combo.addItem("压-温", "PRESS_THEN_TEMP")
-        self.stage_control_order_combo.setToolTip(
-            "温-压：先等待温度稳定，再发送压力目标。\n"
-            "压-温：先等待压力稳定，再发送温度目标。"
-        )
-        left_grid.addWidget(self.stage_control_order_combo, row, 1)
-
-        left_grid.addWidget(QLabel("光源稳定时间 (s):"), row, 2)
+        left_grid.addWidget(QLabel("光源稳定时间 (s):"), row, 0)
         self.stable_time_spin = QSpinBox(); self.stable_time_spin.setRange(0, 3600); self.stable_time_spin.setValue(10)
-        left_grid.addWidget(self.stable_time_spin, row, 3)
+        left_grid.addWidget(self.stable_time_spin, row, 1)
 
-        left_grid.addWidget(QLabel("循环次数:"), row, 4)
+        left_grid.addWidget(QLabel("循环次数:"), row, 2)
         self.cycles_spin = QSpinBox(); self.cycles_spin.setRange(1, 9999); self.cycles_spin.setValue(10)
-        left_grid.addWidget(self.cycles_spin, row, 5)
+        left_grid.addWidget(self.cycles_spin, row, 3)
         row += 1
 
         left_grid.addWidget(QLabel("保存路径:"), row, 0)
@@ -486,6 +474,12 @@ class LaserLifetimeCalibrationUI(QWidget):
         right_grid.addWidget(self.avg_count_label, 1, 2)
         self.avg_times_spin = QSpinBox(); self.avg_times_spin.setRange(1, 4096); self.avg_times_spin.setValue(64)
         right_grid.addWidget(self.avg_times_spin, 1, 3)
+
+        right_grid.addWidget(QLabel("保存格式:"), 0, 4)
+        self.save_format_combo = QComboBox()
+        self.save_format_combo.addItem("CSV", "CSV")
+        self.save_format_combo.addItem("NPZ", "NPZ")
+        right_grid.addWidget(self.save_format_combo, 0, 5)
 
         scope_box.setLayout(right_grid)
         scope_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
