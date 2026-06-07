@@ -1,0 +1,6 @@
+OceanView 保存光谱步骤：
+1. 在 OceanView 图谱窗口顶部点击齿轮/保存参数按钮。
+2. 在 File Options 里把 Target Directory 设置为本文件夹。
+3. 根据需要设置 Basename、File suffix、File Format。
+4. 在 Save Options 里选择保存频率，例如 Save every scan 或 Stop after this many scans。
+5. 回到图谱窗口点击保存按钮，OceanView 会把光谱文件写入这里。
