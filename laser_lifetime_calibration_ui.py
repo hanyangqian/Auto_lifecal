@@ -405,6 +405,14 @@ class LaserLifetimeCalibrationUI(QWidget):
         left_grid.setColumnStretch(5, 1)
 
         row = 0
+        left_grid.addWidget(QLabel("标定模式:"), row, 0)
+        self.calibration_mode_combo = QComboBox()
+        self.calibration_mode_combo.addItem("寿命标定", "LIFETIME")
+        self.calibration_mode_combo.addItem("光谱标定", "SPECTRUM")
+        self.calibration_mode_combo.addItem("寿命-光谱联合标定", "LIFETIME_SPECTRUM")
+        left_grid.addWidget(self.calibration_mode_combo, row, 1)
+        row += 1
+
         left_grid.addWidget(QLabel("光源稳定时间 (s):"), row, 0)
         self.stable_time_spin = QSpinBox(); self.stable_time_spin.setRange(0, 3600); self.stable_time_spin.setValue(10)
         left_grid.addWidget(self.stable_time_spin, row, 1)

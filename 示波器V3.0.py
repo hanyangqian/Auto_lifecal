@@ -689,9 +689,9 @@ def read_waveform_mdo34(scope, ch_name: str):
     data_stop = _query_optional(scope, "DATA:STOP?")
 
     # Use explicit WFMOutpre commands from the manual rather than DATA:ENC abbreviation.
-    # Width 1 is the manual's analog waveform example and avoids huge 2-byte transfers.
+    # Width 2 improves voltage precision on MDO34 compared with 8-bit transfers.
     _w(scope, "WFMOUTPRE:ENCDG BINARY")
-    _w(scope, "WFMOUTPRE:BYT_NR 1")
+    _w(scope, "WFMOUTPRE:BYT_NR 2")
     _w(scope, "WFMOUTPRE:BN_FMT RI")
     _w(scope, "WFMOUTPRE:BYT_OR MSB")
 
@@ -708,14 +708,17 @@ def read_waveform_mdo34(scope, ch_name: str):
     byt_nr = _q(scope, f"{preamble}:BYT_NR?").strip()
     bn_fmt = _q(scope, f"{preamble}:BN_FMT?").strip()
     byt_or = _q(scope, f"{preamble}:BYT_OR?").strip().upper()
+    width = int(float(extract_last_value(byt_nr)))
+    dtype = "h" if width == 2 else "b"
+    is_big_endian = width == 2 and "MSB" in byt_or
 
     with temporary_timeout(scope, MDO34_CURVE_TIMEOUT_MS):
         with binary_transfer_mode(scope):
             raw = scope.query_binary_values(
                 "CURVE?",
-                datatype="b",
+                datatype=dtype,
                 container=np.array,
-                is_big_endian=True,
+                is_big_endian=is_big_endian,
                 expect_termination=True,
                 chunk_size=1024 * 1024,
             )
@@ -725,16 +728,13 @@ def read_waveform_mdo34(scope, ch_name: str):
     if len(raw) != recl:
         recl = len(raw)
 
-    # 3 Series MDO manual analog conversion formula:
-    # Yi = YZERO + YMULT * DataPointi
-    # Do not subtract YOFF here.
-    v = yzero + ymult * raw
+    v = (raw - yoff) * ymult + yzero
     t = xzero + np.arange(recl) * xincr
 
     return t, v, {
         "scope": "MDO34",
-        "width": 1,
-        "dtype": "b",
+        "width": width,
+        "dtype": dtype,
         "composition": "N/A",
         "recl": recl,
         "record_length": record_length,
@@ -749,6 +749,9 @@ def read_waveform_mdo34(scope, ch_name: str):
         "yzero": yzero,
         "xincr": xincr,
         "xzero": xzero,
+        "raw_min": float(np.nanmin(raw)) if len(raw) else None,
+        "raw_max": float(np.nanmax(raw)) if len(raw) else None,
+        "scale_formula": "(raw - YOFF) * YMULT + YZERO",
     }
 
 

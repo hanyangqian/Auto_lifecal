@@ -1,4 +1,6 @@
 from pathlib import Path
+from decimal import Decimal, ROUND_HALF_UP
+import re
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
@@ -17,7 +19,13 @@ FILE_PATTERN = "*.txt"
 
 DATA_START_MARKER = ">>>>>Begin Spectral Data<<<<<"
 FILE_ENCODING = "gb18030"
+WAVELENGTH_QUANTUM = Decimal("0.001")
+WAVELENGTH_TOLERANCE = 0.0015
 BACKGROUND_PREFIX = "back"
+MAIN_WINDOW_SPECTRUM_PREFIX_RE = re.compile(
+    r"^(?P<temperature>[+-]?\d+(?:\.\d+)?)C_(?P<pressure>(?:[+-]?\d+(?:\.\d+)?|current))kPa(?:_|$)",
+    re.IGNORECASE,
+)
 
 # Keep this empty to process BACKGROUND_PREFIX plus numeric temperature prefixes.
 # Example: ALLOWED_SAMPLE_PREFIXES = ["25", "50", "75"]
@@ -105,7 +113,7 @@ def read_spectrum(file_path: Path) -> Tuple[List[float], List[float]]:
             if len(parts) < 2:
                 continue
 
-            wavelengths.append(float(parts[0]))
+            wavelengths.append(float(Decimal(parts[0]).quantize(WAVELENGTH_QUANTUM, rounding=ROUND_HALF_UP)))
             counts.append(float(parts[1]))
 
     if not wavelengths:
@@ -130,7 +138,7 @@ def average_spectra(file_paths: List[Path]) -> Tuple[List[float], List[float]]:
             raise ValueError(f"Point count mismatch: {file_path.name}")
 
         for point_index, wavelength in enumerate(wavelengths):
-            if abs(wavelength - wavelengths_ref[point_index]) > 1e-6:
+            if abs(wavelength - wavelengths_ref[point_index]) > WAVELENGTH_TOLERANCE:
                 raise ValueError(f"Wavelength axis mismatch: {file_path.name}")
             sum_counts[point_index] += counts[point_index]
 
@@ -138,10 +146,22 @@ def average_spectra(file_paths: List[Path]) -> Tuple[List[float], List[float]]:
     return wavelengths_ref, averaged_counts
 
 
+def spectrum_group_key(file_path: Path) -> str:
+    stem = file_path.stem
+    if stem == BACKGROUND_PREFIX or stem.startswith(f"{BACKGROUND_PREFIX}_"):
+        return BACKGROUND_PREFIX
+
+    main_window_match = MAIN_WINDOW_SPECTRUM_PREFIX_RE.match(stem)
+    if main_window_match:
+        return main_window_match.group("temperature")
+
+    return stem.split("_", 1)[0]
+
+
 def collect_groups(txt_files: List[Path]) -> Dict[str, List[Path]]:
     groups: Dict[str, List[Path]] = {}
     for file_path in txt_files:
-        prefix = file_path.stem.split("_", 1)[0]
+        prefix = spectrum_group_key(file_path)
         groups.setdefault(prefix, []).append(file_path)
     return groups
 
@@ -270,7 +290,7 @@ def main() -> None:
             raise ValueError(f"Point count mismatch between background and {prefix}.")
 
         for point_index, wavelength in enumerate(wavelengths):
-            if abs(wavelength - background_wavelengths[point_index]) > 1e-6:
+            if abs(wavelength - background_wavelengths[point_index]) > WAVELENGTH_TOLERANCE:
                 raise ValueError(f"Wavelength axis mismatch between background and {prefix}.")
 
         temperature_groups[prefix] = subtract_background(counts, background_counts)

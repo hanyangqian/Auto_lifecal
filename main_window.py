@@ -8,6 +8,8 @@ import traceback
 import threading
 import gc
 from contextlib import contextmanager
+from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Set
 
 import numpy as np
@@ -40,9 +42,10 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QStyledItemDelegate,
+    QSpinBox,
 )
 
-from laser_lifetime_calibration_ui import LaserLifetimeCalibrationUI
+from laser_lifetime_calibration_ui import Figure, FigureCanvas, LaserLifetimeCalibrationUI
 
 
 SERIAL_LOCK = "C030795"
@@ -51,12 +54,21 @@ CURVE_TIMEOUT_MS = 12000
 MDO34_CURVE_TIMEOUT_MS = 120000
 SCREENSHOT_TIMEOUT_MS = 20000
 DISCOVERY_TIMEOUT_MS = 1500
+SCOPE_LOCK_DISCOVERY_TIMEOUT_MS = 2500
 SCOPE_RECOVERY_CLEAR_TIMEOUT_MS = 1000
+DPO2024B_SAVE_SCREENSHOT = False
+SCOPE_HEARTBEAT_BEFORE_CYCLE = True
+SCOPE_LOCK_ATTEMPTS = 4
 HOTPLATE_BAUD_CANDIDATES = (9600, 115200)
 HOTPLATE_QUERY_WAIT_S = 0.35
 PLOT_TICK_S = 0.2
 SIGGEN_BAUD = 115200
 SIGGEN_COMMAND_DELAY_S = 0.2
+SIGGEN_LIFETIME_FREQ_HZ = 10.0
+SIGGEN_LIFETIME_AMPLITUDE_VPP = 5.0
+SIGGEN_LIFETIME_OFFSET_V = 2.5
+SIGGEN_LIFETIME_DUTY_PERCENT = 50.0
+SIGGEN_SPECTRUM_DC_V = 5.0
 TARGET_HOLD_S = 20.0
 MAX_RAMP_RATE = 20.0
 SERIAL_PROBE_TIMEOUT_S = 0.1
@@ -74,12 +86,14 @@ LOG_HOTPLATE_COMMANDS = False
 LOG_CAPTURE_DETAIL = False
 LOG_STAGE_DETAIL_LIMIT = 4
 CURRENT_SCOPE_SAVE_FORMAT = "CSV"
-FNAME_RE = re.compile(r"^T(\d+)(?:[_-]?(CH[1-4](?:CH[1-4])*))?\.(?:CSV|NPZ)$", re.IGNORECASE)
+FNAME_RE = re.compile(r"^T(\d+)(?:[_-]?(CH[1-4](?:CH[1-4])*))?\.(?:CSV|NPZ|PNG)(?:\.NPZ)?$", re.IGNORECASE)
 TEST_PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xff\xff?"
     b"\x00\x05\xfe\x02\xfeA\xe2!\xbc\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+SPECTRUM_DATA_START_MARKER = ">>>>>Begin Spectral Data<<<<<"
+SPECTRUM_WAVELENGTH_QUANTUM = Decimal("0.001")
 
 
 class ScopeProfile:
@@ -205,6 +219,128 @@ class ChannelDialog(QDialog):
         return {name for name, cb in self.checks.items() if cb.isChecked()}
 
 
+class SpectrumPreviewDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("光谱实时预览")
+        self.resize(760, 460)
+        self.wavelengths = None
+        self.intensities = None
+
+        layout = QVBoxLayout(self)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("积分时间(ms):"))
+        self.integration_spin = QSpinBox()
+        self.integration_spin.setRange(1, 600000)
+        self.integration_spin.setButtonSymbols(QSpinBox.NoButtons)
+        self.integration_spin.setValue(int(getattr(parent, "spectrum_integration_ms", 100)))
+        self.integration_spin.setEnabled(False)
+        controls.addWidget(self.integration_spin)
+
+        controls.addWidget(QLabel("平均次数:"))
+        self.average_spin = QSpinBox()
+        self.average_spin.setRange(1, 100)
+        self.average_spin.setButtonSymbols(QSpinBox.NoButtons)
+        self.average_spin.setValue(int(getattr(parent, "spectrum_average_count", 1)))
+        self.average_spin.setEnabled(False)
+        controls.addWidget(self.average_spin)
+
+        controls.addWidget(QLabel("刷新间隔(ms):"))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1000, 60000)
+        self.interval_spin.setButtonSymbols(QSpinBox.NoButtons)
+        self.interval_spin.setValue(3000)
+        controls.addWidget(self.interval_spin)
+
+        self.start_button = QPushButton("开始")
+        self.stop_button = QPushButton("停止")
+        self.stop_button.setEnabled(False)
+        controls.addWidget(self.start_button)
+        controls.addWidget(self.stop_button)
+        layout.addLayout(controls)
+
+        self.status_label = QLabel("Ready")
+        if Figure is None or FigureCanvas is None:
+            self.canvas = None
+            self.line = None
+            layout.addWidget(QLabel("未检测到 matplotlib，无法显示实时曲线。"))
+        else:
+            self.figure = Figure(figsize=(7.4, 3.8), dpi=100)
+            self.ax = self.figure.add_subplot(111)
+            self.ax.set_xlabel("Wavelength (nm)")
+            self.ax.set_ylabel("Counts")
+            self.ax.grid(color="#d9e2ec", linestyle="-", linewidth=0.8)
+            self.ax.set_ylim(0, 63000)
+            self.line, = self.ax.plot([], [], linewidth=1.0)
+            self.canvas = FigureCanvas(self.figure)
+            layout.addWidget(self.canvas, 1)
+        layout.addWidget(self.status_label)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.read_once)
+        self.start_button.clicked.connect(self.start_preview)
+        self.stop_button.clicked.connect(self.stop_preview)
+
+    def start_preview(self):
+        if self.canvas is None:
+            self.status_label.setText("缺少 matplotlib")
+            return
+
+        self.read_once()
+        self.timer.start(int(self.interval_spin.value()))
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.interval_spin.setEnabled(False)
+
+    def read_once(self):
+        if self.canvas is None:
+            return
+        spectrometer = None
+        try:
+            import seabreeze.spectrometers as sb
+
+            integration_ms = int(getattr(self.parent(), "spectrum_integration_ms", self.integration_spin.value()))
+            average_count = int(getattr(self.parent(), "spectrum_average_count", self.average_spin.value()))
+            self.integration_spin.setValue(integration_ms)
+            self.average_spin.setValue(average_count)
+            spectrometer = sb.Spectrometer.from_first_available()
+            spectrometer.integration_time_micros(integration_ms * 1000)
+            wavelengths, intensities = read_averaged_spectrum(spectrometer, average_count)
+            self.wavelengths = np.asarray(wavelengths, dtype=float)
+            self.intensities = np.asarray(intensities, dtype=float)
+            self.line.set_data(self.wavelengths, self.intensities)
+            self.ax.set_xlim(float(np.nanmin(self.wavelengths)), float(np.nanmax(self.wavelengths)))
+            y_max = float(np.nanmax(self.intensities))
+            self.ax.set_ylim(0, 63000)
+            self.canvas.draw_idle()
+            self.status_label.setText(
+                f"读取成功: {len(self.wavelengths)} 点, max={y_max:.0f}, 积分={self.integration_spin.value()} ms, 平均={self.average_spin.value()}"
+            )
+        except ImportError:
+            self.status_label.setText("未安装 seabreeze")
+            self.stop_preview()
+        except Exception as ex:
+            self.status_label.setText(f"读取失败: {ex}")
+            self.stop_preview()
+        finally:
+            try:
+                if spectrometer is not None:
+                    spectrometer.close()
+            except Exception:
+                pass
+
+    def stop_preview(self):
+        self.timer.stop()
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.interval_spin.setEnabled(True)
+
+    def closeEvent(self, event):
+        self.stop_preview()
+        event.accept()
+
+
 class AxisModeDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         combo = QComboBox(parent)
@@ -276,7 +412,12 @@ def _probe_scope_identity(rm, resource: str):
                 pass
 
 
-def discover_scope_resource_robust(serial_lock: str, cached_resource: str = "", manual_resource: str = ""):
+def discover_scope_resource_robust(
+    serial_lock: str,
+    cached_resource: str = "",
+    manual_resource: str = "",
+    connection_mode: str = "AUTO",
+):
     rm = pyvisa.ResourceManager()
     try:
         resources = list(rm.list_resources())
@@ -286,25 +427,40 @@ def discover_scope_resource_robust(serial_lock: str, cached_resource: str = "", 
         ]
         tcpip_resources = [r for r in resources if r.upper().startswith("TCPIP")]
 
+        connection_mode = (connection_mode or "AUTO").upper()
+        use_usb = connection_mode in ("AUTO", "USB")
+        use_tcpip = connection_mode in ("AUTO", "TCPIP")
+
         search_order = []
-        manual_resource = build_tcpip_resource(manual_resource)
+        manual_resource = build_tcpip_resource(manual_resource) if use_tcpip else ""
+        cached_is_allowed = (
+            not cached_resource
+            or connection_mode == "AUTO"
+            or (use_usb and cached_resource.upper().startswith("USB"))
+            or (use_tcpip and cached_resource.upper().startswith("TCPIP"))
+        )
         if manual_resource:
             search_order.append(manual_resource)
-        if cached_resource and cached_resource not in search_order:
+        if cached_resource and cached_is_allowed and cached_resource not in search_order:
             search_order.append(cached_resource)
-        if serial_lock:
+        if use_usb and serial_lock:
             for r in usb_resources:
                 if serial_lock.upper() in r.upper() and r not in search_order:
                     search_order.append(r)
         tek_usb = [r for r in usb_resources if "0X0699" in r.upper() or "0699" in r.upper()]
-        for r in tek_usb + usb_resources + tcpip_resources:
-            if r not in search_order:
-                search_order.append(r)
+        if use_usb:
+            for r in tek_usb + usb_resources:
+                if r not in search_order:
+                    search_order.append(r)
+        if use_tcpip:
+            for r in tcpip_resources:
+                if r not in search_order:
+                    search_order.append(r)
 
         if not search_order:
             raise RuntimeError(
                 "未发现任何可尝试的 VISA 资源。请确认示波器已开机、NI-VISA 已安装，"
-                "或在初始化窗口填写示波器 IP / VISA 资源。"
+                "并检查初始化窗口里的示波器连接方式。"
             )
 
         matches = []
@@ -313,9 +469,13 @@ def discover_scope_resource_robust(serial_lock: str, cached_resource: str = "", 
             scope = None
             try:
                 scope = rm.open_resource(resource)
-                scope.timeout = DISCOVERY_TIMEOUT_MS
+                scope.timeout = SCOPE_LOCK_DISCOVERY_TIMEOUT_MS
                 scope.read_termination = "\n"
                 scope.write_termination = "\n"
+                try:
+                    scope.clear()
+                except Exception:
+                    pass
                 idn = scope.query("*IDN?").strip()
                 maker, model, serial, firmware = _parse_idn(idn)
                 profile = profile_from_idn(idn)
@@ -618,7 +778,7 @@ def read_waveform_mdo34(scope, ch_name: str):
 
     # Validated MDO34 command chain.
     _w(scope, "WFMOUTPRE:ENCDG BINARY")
-    _w(scope, "WFMOUTPRE:BYT_NR 1")
+    _w(scope, "WFMOUTPRE:BYT_NR 2")
     _w(scope, "WFMOUTPRE:BN_FMT RI")
     _w(scope, "WFMOUTPRE:BYT_OR MSB")
 
@@ -635,6 +795,9 @@ def read_waveform_mdo34(scope, ch_name: str):
     byt_nr = _q(scope, f"{preamble}:BYT_NR?").strip()
     bn_fmt = _q(scope, f"{preamble}:BN_FMT?").strip()
     byt_or = _q(scope, f"{preamble}:BYT_OR?").strip().upper()
+    width = int(float(extract_last_value(byt_nr)))
+    dtype = "h" if width == 2 else "b"
+    is_big_endian = width == 2 and "MSB" in byt_or
 
     raw = None
     transfer_error = None
@@ -644,9 +807,9 @@ def read_waveform_mdo34(scope, ch_name: str):
                 with binary_transfer_mode(scope):
                     raw = scope.query_binary_values(
                         "CURVE?",
-                        datatype="b",
+                        datatype=dtype,
                         container=np.array,
-                        is_big_endian=True,
+                        is_big_endian=is_big_endian,
                         expect_termination=True,
                         chunk_size=1024 * 1024,
                     )
@@ -674,13 +837,13 @@ def read_waveform_mdo34(scope, ch_name: str):
     if len(raw) != recl:
         recl = len(raw)
 
-    v = yzero + ymult * raw
+    v = (raw - yoff) * ymult + yzero
     t = xzero + np.arange(recl) * xincr
 
     return t, v, {
         "scope": "MDO34",
-        "width": 1,
-        "dtype": "b",
+        "width": width,
+        "dtype": dtype,
         "composition": "N/A",
         "recl": recl,
         "record_length": record_length,
@@ -693,6 +856,9 @@ def read_waveform_mdo34(scope, ch_name: str):
         "yzero": yzero,
         "xincr": xincr,
         "xzero": xzero,
+        "raw_min": float(np.nanmin(raw)) if len(raw) else None,
+        "raw_max": float(np.nanmax(raw)) if len(raw) else None,
+        "scale_formula": "(raw - YOFF) * YMULT + YZERO",
     }
 
 
@@ -727,14 +893,21 @@ def make_screenshot_filename(idx: int, channels):
     return f"{name}.PNG"
 
 
+def existing_capture_path_variants(path: str) -> list[str]:
+    variants = [path]
+    if path.lower().endswith(".npz"):
+        variants.append(path + ".npz")
+    return variants
+
+
 def make_available_capture_paths(save_dir: str, start_idx: int, channels, save_format="CSV"):
-    idx = start_idx
+    idx = max(start_idx, next_index(save_dir))
     while True:
         waveform_name = make_filename(idx, channels, save_format)
         screenshot_name = make_screenshot_filename(idx, channels)
         waveform_path = os.path.join(save_dir, waveform_name)
         screenshot_path = os.path.join(save_dir, screenshot_name)
-        if not os.path.exists(waveform_path) and not os.path.exists(screenshot_path):
+        if not any(os.path.exists(path) for path in existing_capture_path_variants(waveform_path)) and not os.path.exists(screenshot_path):
             return idx, waveform_path, screenshot_path
         idx += 1
 
@@ -768,15 +941,19 @@ def save_csv(save_path: str, data: dict):
     if os.path.splitext(save_path)[1].lower() == ".npz":
         save_npz(save_path, data)
         return
-    pd.DataFrame(data).to_csv(_next_non_existing_capture_path(save_path), index=False)
+    if os.path.exists(save_path):
+        raise FileExistsError(f"Capture file already exists: {save_path}")
+    pd.DataFrame(data).to_csv(save_path, index=False, float_format="%.5f")
 
 
 def save_npz(save_path: str, data: dict, meta=None):
-    save_path = _next_non_existing_capture_path(save_path)
+    if any(os.path.exists(path) for path in existing_capture_path_variants(save_path)):
+        raise FileExistsError(f"Capture file already exists: {save_path}")
     arrays = {name: np.asarray(values) for name, values in data.items()}
     if meta is not None:
         arrays["__meta_json__"] = np.asarray(json.dumps(meta, ensure_ascii=False, indent=2))
-    np.savez(save_path, **arrays)
+    with open(save_path, "wb") as file:
+        np.savez(file, **arrays)
 
 
 def save_waveform_file(save_path: str, data: dict, save_format="CSV", meta=None):
@@ -784,6 +961,18 @@ def save_waveform_file(save_path: str, data: dict, save_format="CSV", meta=None)
         save_npz(save_path, data, meta=meta)
     else:
         save_csv(save_path, data)
+
+
+def read_averaged_spectrum(spectrometer, scans_to_average: int):
+    scans = max(1, int(scans_to_average))
+    wavelengths, intensities = spectrometer.spectrum()
+    if scans <= 1:
+        return wavelengths, intensities
+    summed = np.asarray(intensities, dtype=float)
+    for _ in range(scans - 1):
+        _, next_intensities = spectrometer.spectrum()
+        summed += np.asarray(next_intensities, dtype=float)
+    return wavelengths, summed / scans
 
 
 def _extract_scpi_block_payload(raw: bytes) -> bytes:
@@ -888,9 +1077,14 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.data_log_enabled = False
         self._log_write_err_reported = False
         self.info_fit_window = None
+        self.spectrum_preview_window = None
         self.siggen_com_port = ""
         self.siggen_channels = {"CH1"}
         self.scope_manual_resource = ""
+        self.scope_connection_mode = "USB"
+        self.spectrum_integration_ms = 100
+        self.spectrum_average_count = 1
+        self.siggen_lifetime_freq_hz = SIGGEN_LIFETIME_FREQ_HZ
 
         self.channel_btn = QPushButton()
         self._update_channel_button_text()
@@ -922,29 +1116,170 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
         self.browse_btn.clicked.connect(self.choose_path)
         self.init_btn.clicked.connect(self.initialize_system)
+        self.spectrum_preview_btn = QPushButton("光谱实时")
+        self.spectrum_preview_btn.clicked.connect(self.open_spectrum_preview)
+        action_layout = self.init_btn.parentWidget().layout()
+        if action_layout is not None:
+            action_layout.insertWidget(1, self.spectrum_preview_btn, 1)
         self.start_btn.setCheckable(False)
         self.start_btn.clicked.connect(self.on_run_pause_clicked)
         self.stop_btn.clicked.connect(self.request_task_stop)
         self.avg_checkbox.toggled.connect(self.on_avg_toggled)
         self.single_mode_btn.toggled.connect(self.on_capture_mode_toggled)
-        self.avg_count_combo.currentIndexChanged.connect(self.on_avg_count_changed)
         self.save_format_combo.currentIndexChanged.connect(self.on_save_format_changed)
         self.fit_settings_btn.clicked.connect(self.open_lifetime_fit_settings)
         self.fit_enable_btn.toggled.connect(self.on_fit_enable_toggled)
         self.temp_custom_edit_btn.clicked.connect(self.edit_custom_axis_path)
 
-        self.on_avg_toggled(self.avg_checkbox.isChecked())
-
         self.load_port_settings()
         self.load_saved_path()
         self.load_fit_enable_setting()
         self.load_save_format_setting()
+        self.load_run_settings()
         self.load_custom_axis_settings()
+        self.avg_count_combo.currentIndexChanged.connect(self.on_avg_count_changed)
+        self.cycles_spin.valueChanged.connect(self.on_run_setting_changed)
+        self.stable_time_spin.valueChanged.connect(self.on_run_setting_changed)
+        self.on_avg_toggled(self.avg_checkbox.isChecked())
         self.update_path_summary()
         self.settings_button.hide()
         self.test_mode_label.setVisible(TEST_MODE)
         self._ui_init_done = True
         self.append_status("[系统] 已加载主窗口")
+
+    def get_calibration_mode(self) -> str:
+        mode = self.calibration_mode_combo.currentData()
+        if mode not in ("LIFETIME", "SPECTRUM", "LIFETIME_SPECTRUM"):
+            return "LIFETIME"
+        return str(mode)
+
+    @staticmethod
+    def _format_spectrum_condition_value(value, unit: str) -> str:
+        if value is None:
+            return f"current{unit}"
+        try:
+            return f"{float(value):g}{unit}"
+        except Exception:
+            return f"{value}{unit}"
+
+    def _spectrum_filename_prefix(self, stage: dict) -> str:
+        temp_text = self._format_spectrum_condition_value(stage.get("temp"), "C")
+        press_text = self._format_spectrum_condition_value(stage.get("press"), "kPa")
+        prefix = f"{temp_text}_{press_text}"
+        return re.sub(r"[^0-9A-Za-z_.+-]+", "_", prefix).strip("_") or "spectrum"
+
+    def _write_oceanview_spectrum_txt(self, path: str, wavelengths, intensities, metadata: dict[str, str]) -> str:
+        save_path = _next_non_existing_capture_path(path)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "w", encoding="gb18030") as file:
+            for key, value in metadata.items():
+                file.write(f"# {key}: {value}\n")
+            file.write(f"{SPECTRUM_DATA_START_MARKER}\n")
+            for wavelength, intensity in zip(wavelengths, intensities):
+                official_wavelength = Decimal(str(float(wavelength))).quantize(
+                    SPECTRUM_WAVELENGTH_QUANTUM,
+                    rounding=ROUND_HALF_UP,
+                )
+                file.write(f"{official_wavelength}\t{float(intensity):.0f}\n")
+        return save_path
+
+    def _capture_spectrum_for_stage(
+        self,
+        save_dir: str,
+        stage: dict,
+        stage_idx: int,
+        stage_total: int,
+        cycle_no: int | None = None,
+        cycle_total: int | None = None,
+    ) -> str:
+        integration_ms = int(self.spectrum_integration_ms)
+        integration_us = integration_ms * 1000
+        average_count = max(1, int(self.spectrum_average_count))
+        prefix = self._spectrum_filename_prefix(stage)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        save_path = os.path.join(save_dir, f"{prefix}_{stamp}.txt")
+
+        metadata = {
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+            "integration_time_us": str(integration_us),
+            "scans_to_average": str(average_count),
+            "calibration_mode": self.get_calibration_mode(),
+            "stage": f"{stage_idx}/{stage_total}",
+            "cycle": "" if cycle_no is None or cycle_total is None else f"{cycle_no}/{cycle_total}",
+            "temperature_C": "" if stage.get("temp") is None else f"{float(stage.get('temp')):g}",
+            "pressure_kPa": "" if stage.get("press") is None else f"{float(stage.get('press')):g}",
+        }
+
+        if TEST_MODE:
+            wavelengths = np.linspace(315.719, 1027.352, TEST_CAPTURE_POINTS)
+            intensities = 4000.0 + 150.0 * np.sin(np.linspace(0, 8, TEST_CAPTURE_POINTS))
+            metadata.update({"model": "TEST_SPECTROMETER", "serial_number": "TEST"})
+            return self._write_oceanview_spectrum_txt(save_path, wavelengths, intensities, metadata)
+
+        try:
+            import seabreeze.spectrometers as sb
+        except ImportError as exc:
+            raise RuntimeError("未安装 seabreeze，无法保存光谱。请先安装: pip install seabreeze") from exc
+
+        spectrometer = None
+        try:
+            spectrometer = sb.Spectrometer.from_first_available()
+            spectrometer.integration_time_micros(integration_us)
+            wavelengths, intensities = read_averaged_spectrum(spectrometer, average_count)
+            metadata.update(
+                {
+                    "model": str(getattr(spectrometer, "model", "")),
+                    "serial_number": str(getattr(spectrometer, "serial_number", "unknown")),
+                }
+            )
+            return self._write_oceanview_spectrum_txt(save_path, wavelengths, intensities, metadata)
+        finally:
+            try:
+                if spectrometer is not None:
+                    spectrometer.close()
+            except Exception:
+                pass
+
+    def get_spectrometer_identity_status(self):
+        if TEST_MODE:
+            return True, "TEST_SPECTROMETER"
+        try:
+            import seabreeze.spectrometers as sb
+        except ImportError:
+            return False, "未安装 seabreeze"
+
+        spectrometer = None
+        try:
+            devices = sb.list_devices()
+            if not devices:
+                return False, "未找到"
+            spectrometer = sb.Spectrometer(devices[0])
+            model = str(getattr(spectrometer, "model", "") or "").strip()
+            serial_number = str(getattr(spectrometer, "serial_number", "") or "").strip()
+            label = " ".join(part for part in (model, serial_number) if part)
+            return True, label or str(devices[0])
+        except Exception as ex:
+            return False, f"失败: {str(ex)[:32]}"
+        finally:
+            try:
+                if spectrometer is not None:
+                    spectrometer.close()
+            except Exception:
+                pass
+
+    def open_spectrum_preview(self):
+        if self.spectrum_preview_window is None:
+            self.spectrum_preview_window = SpectrumPreviewDialog(self)
+            self.spectrum_preview_window.destroyed.connect(lambda *_: setattr(self, "spectrum_preview_window", None))
+        self.spectrum_preview_window.show()
+        self.spectrum_preview_window.raise_()
+        self.spectrum_preview_window.activateWindow()
+
+    def _current_mode_device_requirements(self) -> tuple[bool, bool]:
+        mode = self.get_calibration_mode()
+        needs_scope = mode in ("LIFETIME", "LIFETIME_SPECTRUM")
+        needs_spectrometer = mode in ("SPECTRUM", "LIFETIME_SPECTRUM")
+        return needs_scope, needs_spectrometer
 
     def _stage_control_order(self) -> str:
         order = self.settings.value("stage_control_order_v2", "TEMP_THEN_PRESS", type=str)
@@ -1401,14 +1736,34 @@ class MainWindow(LaserLifetimeCalibrationUI):
             press_targets = self._build_manual_axis_targets(self.press_manual_points_edit.text(), "压力")
             temp_enabled = self.temp_cal_btn.isChecked()
             press_enabled = self.press_cal_btn.isChecked()
-            temp_text = f"温度 {'启用' if temp_enabled else '关闭'} / {len(temp_targets)} 点" if temp_targets else "温度未配置"
-            press_text = f"压力 {'启用' if press_enabled else '关闭'} / {len(press_targets)} 点" if press_targets else "压力未配置"
+            temp_values = [item.get("value") for item in temp_targets if item.get("value") is not None]
+            press_values = [item.get("value") for item in press_targets if item.get("value") is not None]
+            if temp_values:
+                temp_text = (
+                    f"温度 {'启用' if temp_enabled else '关闭'} / {len(temp_values)} 点: "
+                    f"{self._format_value_list_preview(temp_values, '', limit=3)}"
+                )
+                temp_tip = f"温度 {'启用' if temp_enabled else '关闭'}: {self._format_value_list_preview(temp_values, '', limit=12)}"
+            else:
+                temp_text = "温度未配置"
+                temp_tip = temp_text
+            if press_values:
+                press_text = (
+                    f"压力 {'启用' if press_enabled else '关闭'} / {len(press_values)} 点: "
+                    f"{self._format_value_list_preview(press_values, '', limit=3)}"
+                )
+                press_tip = f"压力 {'启用' if press_enabled else '关闭'}: {self._format_value_list_preview(press_values, '', limit=12)}"
+            else:
+                press_text = "压力未配置"
+                press_tip = press_text
             total = (len(temp_targets) if temp_enabled and temp_targets else 1) * (
                 len(press_targets) if press_enabled and press_targets else 1
             )
             label.setText(f"{temp_text} / {press_text} / 总工况 {total}")
+            label.setToolTip(f"{temp_tip}\n{press_tip}\n总工况: {total}")
         except Exception:
             label.setText("路径需要检查")
+            label.setToolTip("路径需要检查")
 
     def edit_custom_axis_path(self):
         dialog = QDialog(self)
@@ -1754,6 +2109,24 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if getattr(self, "_ui_init_done", False):
             self.append_status(f"[示波器] 保存格式: {fmt}")
 
+    def load_run_settings(self):
+        stable_time = self.settings.value("run_stable_time_s", self.stable_time_spin.value(), type=int)
+        cycles = self.settings.value("run_cycles", self.cycles_spin.value(), type=int)
+        avg_count = self.settings.value("scope_avg_count", self.get_avg_count(), type=int)
+        self.stable_time_spin.setValue(max(self.stable_time_spin.minimum(), min(self.stable_time_spin.maximum(), int(stable_time))))
+        self.cycles_spin.setValue(max(self.cycles_spin.minimum(), min(self.cycles_spin.maximum(), int(cycles))))
+        idx = self.avg_count_combo.findData(int(avg_count))
+        if idx >= 0:
+            self.avg_count_combo.setCurrentIndex(idx)
+
+    def persist_run_settings(self):
+        self.settings.setValue("run_stable_time_s", int(self.stable_time_spin.value()))
+        self.settings.setValue("run_cycles", int(self.cycles_spin.value()))
+        self.settings.setValue("scope_avg_count", int(self.get_avg_count()))
+
+    def on_run_setting_changed(self, *_):
+        self.persist_run_settings()
+
     def load_custom_axis_settings(self):
         self.temp_cal_btn.setChecked(self.settings.value("temp_axis_enabled", True, type=bool))
         self.press_cal_btn.setChecked(self.settings.value("press_axis_enabled", False, type=bool))
@@ -1787,12 +2160,20 @@ class MainWindow(LaserLifetimeCalibrationUI):
     def load_port_settings(self):
         saved_scope = self.settings.value("scope_com_port", "", type=str).strip()
         saved_scope_resource = self.settings.value("scope_manual_resource", "", type=str).strip()
+        saved_scope_connection_mode = self.settings.value("scope_connection_mode", "USB", type=str).strip().upper()
         saved_hotplate = self.settings.value("hotplate_com_port", "", type=str).strip()
         saved_siggen = self.settings.value("siggen_com_port", "", type=str).strip()
         saved_siggen_channels = self.settings.value("siggen_channels", "CH1", type=str).strip()
+        self.spectrum_integration_ms = int(self.settings.value("spectrum_integration_ms", 100, type=int))
+        self.spectrum_average_count = int(self.settings.value("spectrum_average_count", 1, type=int))
+        self.siggen_lifetime_freq_hz = float(
+            self.settings.value("siggen_lifetime_freq_hz", SIGGEN_LIFETIME_FREQ_HZ, type=float)
+        )
         if saved_scope:
             self.scope_com_port = saved_scope
         self.scope_manual_resource = saved_scope_resource
+        if saved_scope_connection_mode in ("USB", "TCPIP", "AUTO"):
+            self.scope_connection_mode = saved_scope_connection_mode
         if saved_hotplate:
             self.hotplate_com_port = saved_hotplate
         if saved_siggen:
@@ -1814,6 +2195,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.settings.setValue("scope_manual_resource", scope_resource)
         else:
             self.settings.remove("scope_manual_resource")
+        self.settings.setValue("scope_connection_mode", self.scope_connection_mode)
         if hotplate_port:
             self.settings.setValue("hotplate_com_port", hotplate_port)
         else:
@@ -1824,6 +2206,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.settings.remove("siggen_com_port")
         channels_text = ",".join(sorted(ch for ch in self.siggen_channels if ch in {"CH1", "CH2"}))
         self.settings.setValue("siggen_channels", channels_text or "CH1")
+        self.settings.setValue("spectrum_integration_ms", int(self.spectrum_integration_ms))
+        self.settings.setValue("spectrum_average_count", int(self.spectrum_average_count))
+        self.settings.setValue("siggen_lifetime_freq_hz", float(self.siggen_lifetime_freq_hz))
 
     def persist_save_path(self):
         save_dir = self.save_path_edit.text().strip()
@@ -1847,35 +2232,75 @@ class MainWindow(LaserLifetimeCalibrationUI):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(10)
 
-        grid.addWidget(QLabel("示波器 IP / VISA:"), 0, 0)
+        grid.addWidget(QLabel("示波器连接方式:"), 0, 0)
+        scope_mode_combo = QComboBox()
+        scope_mode_combo.addItem("USB", "USB")
+        scope_mode_combo.addItem("网口/IP", "TCPIP")
+        scope_mode_combo.addItem("自动", "AUTO")
+        mode_idx = scope_mode_combo.findData(self.scope_connection_mode)
+        scope_mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+        grid.addWidget(scope_mode_combo, 0, 1)
+
+        grid.addWidget(QLabel("示波器 IP / VISA:"), 1, 0)
         scope_resource_edit = QLineEdit()
-        scope_resource_edit.setPlaceholderText("留空自动检测，或输入 10.5.5.88 / TCPIP0::...::INSTR")
+        scope_resource_edit.setPlaceholderText("网口模式输入 10.5.5.88 / TCPIP0::...::INSTR")
         scope_resource_edit.setText(self.scope_manual_resource)
-        grid.addWidget(scope_resource_edit, 0, 1)
+        grid.addWidget(scope_resource_edit, 1, 1)
 
-        grid.addWidget(QLabel("标定台 COM口:"), 1, 0)
+        def sync_scope_resource_enabled():
+            scope_resource_edit.setEnabled(scope_mode_combo.currentData() != "USB")
+
+        scope_mode_combo.currentIndexChanged.connect(sync_scope_resource_enabled)
+        sync_scope_resource_enabled()
+
+        grid.addWidget(QLabel("信号发生器频率 (Hz):"), 2, 0)
+        siggen_freq_spin = QSpinBox()
+        siggen_freq_spin.setRange(1, 1_000_000)
+        siggen_freq_spin.setButtonSymbols(QSpinBox.NoButtons)
+        siggen_freq_spin.setValue(int(round(float(self.siggen_lifetime_freq_hz))))
+        grid.addWidget(siggen_freq_spin, 2, 1)
+
+        grid.addWidget(QLabel("标定台 COM口:"), 3, 0)
         hotplate_combo = QComboBox()
-        grid.addWidget(hotplate_combo, 1, 1)
+        grid.addWidget(hotplate_combo, 3, 1)
 
-        grid.addWidget(QLabel("信号发生器 COM口:"), 2, 0)
+        grid.addWidget(QLabel("信号发生器 COM口:"), 4, 0)
         siggen_combo = QComboBox()
-        grid.addWidget(siggen_combo, 2, 1)
+        grid.addWidget(siggen_combo, 4, 1)
 
-        grid.addWidget(QLabel("信号发生器输出通道:"), 3, 0)
+        grid.addWidget(QLabel("信号发生器输出通道:"), 5, 0)
         siggen_ch_row = QVBoxLayout()
         siggen_ch1 = QCheckBox("CH1")
         siggen_ch2 = QCheckBox("CH2")
         siggen_ch_row.addWidget(siggen_ch1)
         siggen_ch_row.addWidget(siggen_ch2)
-        grid.addLayout(siggen_ch_row, 3, 1)
+        grid.addLayout(siggen_ch_row, 5, 1)
 
-        status_label = QLabel("示波器留空时自动检测 USB/TCPIP；COM 设备可自动检测")
-        grid.addWidget(status_label, 4, 0, 1, 2)
+        grid.addWidget(QLabel("光谱仪:"), 6, 0)
+        spectrometer_status_label = QLabel("未检测")
+        grid.addWidget(spectrometer_status_label, 6, 1)
+
+        grid.addWidget(QLabel("光谱积分时间 (ms):"), 7, 0)
+        spectrum_integration_spin = QSpinBox()
+        spectrum_integration_spin.setRange(1, 600000)
+        spectrum_integration_spin.setButtonSymbols(QSpinBox.NoButtons)
+        spectrum_integration_spin.setValue(int(self.spectrum_integration_ms))
+        grid.addWidget(spectrum_integration_spin, 7, 1)
+
+        grid.addWidget(QLabel("光谱平均次数:"), 8, 0)
+        spectrum_average_spin = QSpinBox()
+        spectrum_average_spin.setRange(1, 100)
+        spectrum_average_spin.setButtonSymbols(QSpinBox.NoButtons)
+        spectrum_average_spin.setValue(int(self.spectrum_average_count))
+        grid.addWidget(spectrum_average_spin, 8, 1)
+
+        status_label = QLabel("USB 模式只尝试 USB VISA；网口模式只尝试 TCPIP/IP")
+        grid.addWidget(status_label, 9, 0, 1, 2)
         layout.addLayout(grid)
 
         tools_layout = QGridLayout()
         refresh_btn = QPushButton("刷新端口")
-        auto_btn = QPushButton("自动检测(100ms)")
+        auto_btn = QPushButton("自动检测")
         tools_layout.addWidget(refresh_btn, 0, 0)
         tools_layout.addWidget(auto_btn, 0, 1)
         layout.addLayout(tools_layout)
@@ -1899,6 +2324,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
             ensure_current(siggen_combo, self.siggen_com_port)
             siggen_ch1.setChecked("CH1" in self.siggen_channels)
             siggen_ch2.setChecked("CH2" in self.siggen_channels)
+            spectrometer_status_label.setText("点击自动检测以刷新")
 
         def on_detect_done(result):
             auto_btn.setEnabled(True)
@@ -1916,19 +2342,33 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     siggen_combo.addItem(f"{siggen_val} (自动检测)", siggen_val)
                     idx = siggen_combo.count() - 1
                 siggen_combo.setCurrentIndex(idx)
+            spec_ok = bool(result.get("spectrometer_ok"))
+            spec_sn = result.get("spectrometer_sn", "未检测")
+            spectrometer_status_label.setText(f"{spec_sn}，连接={'是' if spec_ok else '否'}")
             status_label.setText(result.get("message", "自动检测完成"))
 
         def start_auto_detect():
             if self.detect_thread and self.detect_thread.is_alive():
+                status_label.setText("自动检测仍在进行，请稍候...")
                 return
             if serial is None:
                 QMessageBox.warning(self, "缺少依赖", "未安装 pyserial，请先安装: pip install pyserial")
                 return
             auto_btn.setEnabled(False)
-            status_label.setText("正在自动检测串口设备...")
+            status_label.setText("正在自动检测串口设备和光谱仪...")
 
             def worker():
-                result = self._scan_serial_devices()
+                try:
+                    result = self._scan_serial_devices()
+                except Exception as ex:
+                    result = {
+                        "scope_com": None,
+                        "hotplate_com": None,
+                        "siggen_com": None,
+                        "spectrometer_ok": False,
+                        "spectrometer_sn": "未检测",
+                        "message": f"自动检测失败: {ex}",
+                    }
                 QTimer.singleShot(0, lambda r=result: on_detect_done(r))
 
             self.detect_thread = threading.Thread(target=worker, daemon=True)
@@ -1946,9 +2386,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if dialog.exec_() != QDialog.Accepted:
             return
 
+        self.scope_connection_mode = scope_mode_combo.currentData() or "USB"
         self.scope_manual_resource = scope_resource_edit.text().strip()
         self.hotplate_com_port = hotplate_combo.currentData() or self.hotplate_com_port
         self.siggen_com_port = siggen_combo.currentData() or self.siggen_com_port
+        self.spectrum_integration_ms = int(spectrum_integration_spin.value())
+        self.spectrum_average_count = int(spectrum_average_spin.value())
+        self.siggen_lifetime_freq_hz = float(siggen_freq_spin.value())
         channels = set()
         if siggen_ch1.isChecked():
             channels.add("CH1")
@@ -1959,19 +2403,26 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.update_settings_tooltip()
         hot_ok, hot_sn = self.get_hotplate_identity_status()
         sig_ok, sig_sn = self.get_siggen_identity_status()
-        resume_live, resume_plot = self._suspend_hotplate_live_poll()
-        try:
-            scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
-        finally:
-            self._resume_hotplate_live_poll(resume_live, resume_plot)
+        spec_ok, spec_sn = self.get_spectrometer_identity_status()
+        needs_scope, needs_spectrometer = self._current_mode_device_requirements()
+        scope_ok, scope_sn = False, "未检测"
+        if needs_scope:
+            resume_live, resume_plot = self._suspend_hotplate_live_poll()
+            try:
+                scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
+            finally:
+                self._resume_hotplate_live_poll(resume_live, resume_plot)
         if hot_ok:
             self.start_hotplate_live_poll()
         self.append_status(
             f"[初始化] 标定台: 端口={self.hotplate_com_port}, SN={hot_sn}, 连接={'是' if hot_ok else '否'}"
         )
-        self.append_status(
-            f"[初始化] 示波器: 资源={self.resource_str or self.scope_manual_resource or '自动'}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
-        )
+        if needs_scope:
+            self.append_status(
+                f"[初始化] 示波器: 方式={self.scope_connection_mode}, 资源={self.resource_str or self.scope_manual_resource or '自动'}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
+            )
+        if needs_spectrometer:
+            self.append_status(f"[初始化] 光谱仪: SN={spec_sn}, 连接={'是' if spec_ok else '否'}")
         self.append_status(
             f"[初始化] 信号发生器: 端口={self.siggen_com_port or '未配置'}, 状态={sig_sn}, 连接={'是' if sig_ok else '否'}, 通道={','.join(sorted(self.siggen_channels)) or '无'}"
         )
@@ -1985,31 +2436,38 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self.siggen_com_port = self.siggen_com_port or "TEST_SIGGEN"
             self.start_hotplate_live_poll()
             self.append_status("[测试模式] 自动初始化已跳过真实硬件连接")
-            return True, True, True
+            return True, True, True, True
 
         self.persist_port_settings()
         self.update_settings_tooltip()
 
+        needs_scope, needs_spectrometer = self._current_mode_device_requirements()
         hot_ok, hot_sn = self.get_hotplate_identity_status()
         sig_ok, sig_sn = self.get_siggen_identity_status()
-        resume_live, resume_plot = self._suspend_hotplate_live_poll()
-        try:
-            scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
-        finally:
-            self._resume_hotplate_live_poll(resume_live, resume_plot)
+        spec_ok, spec_sn = self.get_spectrometer_identity_status() if needs_spectrometer else (False, "未检测")
+        scope_ok, scope_sn = False, "未检测"
+        if needs_scope:
+            resume_live, resume_plot = self._suspend_hotplate_live_poll()
+            try:
+                scope_ok, scope_sn = self.try_lock_scope(show_error=False, verbose=False)
+            finally:
+                self._resume_hotplate_live_poll(resume_live, resume_plot)
         if hot_ok:
             self.start_hotplate_live_poll()
 
         self.append_status(
             f"[自动初始化] 标定台: 端口={self.hotplate_com_port}, SN={hot_sn}, 连接={'是' if hot_ok else '否'}"
         )
-        self.append_status(
-            f"[自动初始化] 示波器: 资源={self.resource_str or self.scope_manual_resource or '自动'}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
-        )
+        if needs_scope:
+            self.append_status(
+                f"[自动初始化] 示波器: 方式={self.scope_connection_mode}, 资源={self.resource_str or self.scope_manual_resource or '自动'}, SN={scope_sn}, 连接={'是' if scope_ok else '否'}"
+            )
+        if needs_spectrometer:
+            self.append_status(f"[自动初始化] 光谱仪: SN={spec_sn}, 连接={'是' if spec_ok else '否'}")
         self.append_status(
             f"[自动初始化] 信号发生器: 端口={self.siggen_com_port or '未配置'}, 状态={sig_sn}, 连接={'是' if sig_ok else '否'}, 通道={','.join(sorted(self.siggen_channels)) or '无'}"
         )
-        return scope_ok, hot_ok, sig_ok
+        return scope_ok, hot_ok, sig_ok, spec_ok
 
     def _suspend_hotplate_live_poll(self):
         live_active = self.hotplate_live_timer.isActive()
@@ -2060,44 +2518,100 @@ class MainWindow(LaserLifetimeCalibrationUI):
             except Exception:
                 pass
 
+    def _probe_open_serial(self, ser, cmd: str, timeout_s: float = SERIAL_PROBE_TIMEOUT_S) -> str:
+        try:
+            ser.reset_input_buffer()
+            ser.write((cmd + "\r").encode("ascii"))
+            ser.flush()
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                n = ser.in_waiting
+                if n > 0:
+                    return ser.read(n).decode("ascii", errors="ignore").strip("\x00\r\n ")
+                time.sleep(0.005)
+        except Exception:
+            return ""
+        return ""
+
+    def _probe_serial_port_for_devices(self, port: str) -> dict:
+        result = {"scope": False, "hotplate": False, "siggen": False}
+        baud_candidates = list(dict.fromkeys([SIGGEN_BAUD, *HOTPLATE_BAUD_CANDIDATES]))
+        for baud in baud_candidates:
+            ser = None
+            try:
+                ser = serial.Serial(
+                    port,
+                    baudrate=baud,
+                    timeout=SERIAL_PROBE_TIMEOUT_S,
+                    write_timeout=SERIAL_PROBE_TIMEOUT_S,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                )
+                idn = self._probe_open_serial(ser, "*IDN?")
+                idn_l = idn.lower()
+                if "tektronix" in idn_l or SERIAL_LOCK.lower() in idn_l:
+                    result["scope"] = True
+                if "instec,mk2000b" in idn_l:
+                    result["hotplate"] = True
+
+                if not result["hotplate"]:
+                    rt = self._probe_open_serial(ser, "TEMPerature:RTINformation?")
+                    if "MK:" in rt.upper():
+                        result["hotplate"] = True
+
+                if baud == SIGGEN_BAUD and not result["siggen"]:
+                    rmn = self._probe_open_serial(ser, "RMN")
+                    if re.fullmatch(r"\d+", (rmn or "").strip()):
+                        result["siggen"] = True
+            except Exception:
+                pass
+            finally:
+                try:
+                    if ser and ser.is_open:
+                        ser.close()
+                except Exception:
+                    pass
+            if result["scope"] and result["hotplate"] and result["siggen"]:
+                break
+        return result
+
     def _scan_serial_devices(self):
         if serial is None:
-            return {"scope_com": None, "hotplate_com": None, "siggen_com": None, "message": "未安装pyserial"}
+            return {"scope_com": None, "hotplate_com": None, "siggen_com": None, "spectrometer_ok": False, "spectrometer_sn": "未检测", "message": "未安装pyserial"}
         try:
             ports = [p.device for p in list_ports.comports()] if list_ports else []
         except Exception as ex:
-            return {"scope_com": None, "hotplate_com": None, "siggen_com": None, "message": f"串口枚举失败: {ex}"}
+            return {"scope_com": None, "hotplate_com": None, "siggen_com": None, "spectrometer_ok": False, "spectrometer_sn": "未检测", "message": f"串口枚举失败: {ex}"}
 
         scope_com = None
         hotplate_com = None
         siggen_com = None
         for port in ports:
-            for baud in HOTPLATE_BAUD_CANDIDATES:
-                idn = self._probe_port_once(port, baud, "*IDN?")
-                idn_l = idn.lower()
-                if ("tektronix" in idn_l or SERIAL_LOCK.lower() in idn_l) and scope_com is None:
-                    scope_com = port
-                if "instec,mk2000b" in idn_l and hotplate_com is None:
-                    hotplate_com = port
-                if hotplate_com is None:
-                    rt = self._probe_port_once(port, baud, "TEMPerature:RTINformation?")
-                    if "MK:" in rt.upper():
-                        hotplate_com = port
-                if siggen_com is None:
-                    rmn = self._probe_port_once(port, SIGGEN_BAUD, "RMN")
-                    rfn = self._probe_port_once(port, SIGGEN_BAUD, "RFN")
-                    if re.fullmatch(r"\d+", (rmn or "").strip()) and re.fullmatch(r"\d+", (rfn or "").strip()):
-                        siggen_com = port
-                if scope_com and hotplate_com and siggen_com:
-                    break
+            probe = self._probe_serial_port_for_devices(port)
+            if probe["scope"] and scope_com is None:
+                scope_com = port
+            if probe["hotplate"] and hotplate_com is None:
+                hotplate_com = port
+            if probe["siggen"] and siggen_com is None:
+                siggen_com = port
             if scope_com and hotplate_com and siggen_com:
                 break
 
+        spec_ok, spec_sn = self.get_spectrometer_identity_status()
+
         msg = (
             f"自动检测完成: 示波器={scope_com or '未找到'}, 标定台={hotplate_com or '未找到'}, "
-            f"信号发生器={siggen_com or '未找到'}"
+            f"信号发生器={siggen_com or '未找到'}, 光谱仪={spec_sn if spec_ok else '未找到'}"
         )
-        return {"scope_com": scope_com, "hotplate_com": hotplate_com, "siggen_com": siggen_com, "message": msg}
+        return {
+            "scope_com": scope_com,
+            "hotplate_com": hotplate_com,
+            "siggen_com": siggen_com,
+            "spectrometer_ok": spec_ok,
+            "spectrometer_sn": spec_sn,
+            "message": msg,
+        }
 
     def _query_siggen(self, command: str):
         if TEST_MODE:
@@ -2180,6 +2694,74 @@ class MainWindow(LaserLifetimeCalibrationUI):
         state = "ON" if enable else "OFF"
         self.append_status(f"[信号发生器] 通道 {','.join(channels)} 输出命令已发送 -> {state}")
 
+    @staticmethod
+    def _fy6900_frequency_code(hz: float) -> str:
+        # This FY6900 firmware displays WMF/WFF arguments as integer Hz.
+        return f"{int(round(float(hz))):014d}"
+
+    @staticmethod
+    def _fy6900_channel_commands(ch: str, waveform: int, frequency_hz: float, amplitude_vpp: float, offset_v: float, duty_percent: float | None = None):
+        if ch == "CH1":
+            prefix = {"wave": "WMW", "freq": "WMF", "amp": "WMA", "offset": "WMO", "duty": "WMD", "out": "WMN"}
+        elif ch == "CH2":
+            prefix = {"wave": "WFW", "freq": "WFF", "amp": "WFA", "offset": "WFO", "duty": "WFD", "out": "WFN"}
+        else:
+            return []
+
+        cmds = [
+            f"{prefix['out']}0",
+            f"{prefix['wave']}{int(waveform)}",
+            f"{prefix['freq']}{MainWindow._fy6900_frequency_code(frequency_hz)}",
+            f"{prefix['amp']}{float(amplitude_vpp):.3f}",
+            f"{prefix['offset']}{float(offset_v):.3f}",
+        ]
+        if duty_percent is not None:
+            cmds.append(f"{prefix['duty']}{float(duty_percent):.1f}")
+        cmds.append(f"{prefix['out']}1")
+        return cmds
+
+    def _configure_siggen_lifetime_light(self):
+        channels = [ch for ch in sorted(self.siggen_channels) if ch in {"CH1", "CH2"}]
+        if not channels:
+            self.append_status("[信号发生器] 未选择输出通道，跳过寿命方波设置")
+            return
+        cmds = []
+        for ch in channels:
+            cmds.extend(
+                self._fy6900_channel_commands(
+                    ch,
+                    waveform=1,
+                    frequency_hz=float(self.siggen_lifetime_freq_hz),
+                    amplitude_vpp=SIGGEN_LIFETIME_AMPLITUDE_VPP,
+                    offset_v=SIGGEN_LIFETIME_OFFSET_V,
+                    duty_percent=SIGGEN_LIFETIME_DUTY_PERCENT,
+                )
+            )
+        self._send_siggen_commands(cmds)
+        self.append_status(
+            f"[信号发生器] 已设置寿命光源: 方波 {float(self.siggen_lifetime_freq_hz):g} Hz, "
+            "5 Vpp, Offset 2.5 V"
+        )
+
+    def _configure_siggen_spectrum_light(self):
+        channels = [ch for ch in sorted(self.siggen_channels) if ch in {"CH1", "CH2"}]
+        if not channels:
+            self.append_status("[信号发生器] 未选择输出通道，跳过光谱直流设置")
+            return
+        cmds = []
+        for ch in channels:
+            cmds.extend(
+                self._fy6900_channel_commands(
+                    ch,
+                    waveform=6 if ch == "CH1" else 5,
+                    frequency_hz=1.0,
+                    amplitude_vpp=0.0,
+                    offset_v=SIGGEN_SPECTRUM_DC_V,
+                )
+            )
+        self._send_siggen_commands(cmds)
+        self.append_status("[信号发生器] 已设置光谱光源: DC 5 V")
+
     def get_siggen_identity_status(self):
         if TEST_MODE:
             return True, "TEST_SIGGEN"
@@ -2194,7 +2776,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         except Exception as ex:
             return False, f"失败: {str(ex)[:32]}"
 
-    def wait_light_source_stable(self):
+    def wait_light_source_stable(self, next_step_text: str = "开始示波器保存"):
         wait_s = int(self.stable_time_spin.value())
         if TEST_MODE:
             wait_s = min(wait_s, int(TEST_MAX_LIGHT_STABLE_S))
@@ -2224,7 +2806,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 break
             QApplication.processEvents()
             time.sleep(0.2)
-        self.append_status("[光源] 稳定等待完成，开始示波器保存")
+        self.append_status(f"[光源] 稳定等待完成，{next_step_text}")
 
     def start_hotplate_live_poll(self):
         if serial is None and not TEST_MODE:
@@ -2427,7 +3009,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def on_avg_count_changed(self, _index: int):
         if not self._ui_init_done:
+            self.persist_run_settings()
             return
+        self.persist_run_settings()
         if not self.avg_checkbox.isChecked():
             return
         self.append_status(f"[示波器] 平均次数切换: {self.get_avg_count()}")
@@ -2548,6 +3132,55 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if self.stop_requested.is_set():
             raise TaskStoppedError("用户已停止任务")
 
+    def _wait_scope_run_started(self, scope, cycle_idx: int, total_cycles: int, timeout_s: float = 1.2):
+        deadline = time.time() + timeout_s
+        last_state = ""
+        last_trig = ""
+        while time.time() < deadline:
+            self._check_task_control()
+            try:
+                acq = self.query_acquire_status(scope)
+                last_state = acq.get("state", "")
+                last_trig = acq.get("trig_state", "")
+                if last_state == "1" and last_trig != "SAVE":
+                    time.sleep(0.08)
+                    QApplication.processEvents()
+                    return
+            except Exception:
+                pass
+            time.sleep(0.05)
+            QApplication.processEvents()
+        if LOG_CAPTURE_DETAIL:
+            self.append_status(
+                f"[循环 {cycle_idx}/{total_cycles}] RUN确认超时，继续等待采集完成 "
+                f"(state={last_state}, trig={last_trig})"
+            )
+
+    def _wait_scope_average_ready(self, scope, cycle_idx: int, total_cycles: int, timeout_s: float = 30.0):
+        if not self.avg_checkbox.isChecked():
+            time.sleep(0.2)
+            QApplication.processEvents()
+            return
+
+        target = self.get_avg_count()
+        deadline = time.time() + timeout_s
+        last_numacq = -1
+        while time.time() < deadline:
+            paused_s = self._wait_while_paused()
+            if paused_s:
+                deadline += paused_s
+            if self.stop_requested.is_set():
+                raise TaskStoppedError("用户已停止任务")
+            acq = self.query_acquire_status(scope)
+            last_numacq = int(acq.get("numacq", 0))
+            if last_numacq >= target:
+                time.sleep(0.08)
+                QApplication.processEvents()
+                return
+            time.sleep(0.15)
+            QApplication.processEvents()
+        raise RuntimeError(f"第 {cycle_idx} 次循环等待平均完成超时: {last_numacq}/{target}")
+
     def _finish_task_ui(self):
         self.task_running = False
         self.pause_requested.clear()
@@ -2565,16 +3198,17 @@ class MainWindow(LaserLifetimeCalibrationUI):
         profile = scope.profile
         _w(scope, profile.stopafter_run_cmd)
         _w(scope, profile.acq_run_cmd)
-        time.sleep(0.15)
-        QApplication.processEvents()
+        self._wait_scope_run_started(scope, cycle_idx, total_cycles)
 
         if capture_mode == "CONTINUOUS":
+            self._wait_scope_average_ready(scope, cycle_idx, total_cycles)
             if LOG_CAPTURE_DETAIL:
                 self.append_status(f"[循环 {cycle_idx}/{total_cycles}] 连续采样运行")
             return
 
         _w(scope, profile.stopafter_single_cmd)
         _w(scope, profile.acq_run_cmd)
+        self._wait_scope_run_started(scope, cycle_idx, total_cycles)
 
         deadline = time.time() + 30.0
         while time.time() < deadline:
@@ -2655,7 +3289,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.idn = None
         self.profile_name = None
         QApplication.processEvents()
-        time.sleep(min(0.6 * attempt, 2.5))
+        time.sleep(min(0.8 * attempt, 3.0))
         self.try_lock_scope(show_error=False, verbose=False)
 
     def _open_scope_session_with_recovery(self, reason: str = "采集", max_attempts: int = 4):
@@ -2684,6 +3318,14 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     self._recover_scope_connection(reason, previous_resource, attempt)
         raise RuntimeError(f"示波器重连失败（{reason}）\n" + "\n".join(errors))
 
+    def _scope_heartbeat(self, scope, reason: str = ""):
+        if TEST_MODE or not SCOPE_HEARTBEAT_BEFORE_CYCLE:
+            return
+        with temporary_timeout(scope, 1500):
+            idn = scope.query("*IDN?").strip()
+        if not idn:
+            raise RuntimeError(f"示波器心跳无响应（{reason}）")
+
     @staticmethod
     def _is_scope_recoverable_error(ex: Exception) -> bool:
         if isinstance(ex, pyvisa.errors.VisaIOError):
@@ -2700,7 +3342,12 @@ class MainWindow(LaserLifetimeCalibrationUI):
             "截屏",
             "HARDCOPY",
             "USB",
+            "USBTMC",
             "DEVICE",
+            "NO LISTENERS",
+            "RESOURCE",
+            "INVALID SESSION",
+            "SESSION",
         )
         return any(m in text for m in markers)
 
@@ -2713,36 +3360,53 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self.append_status("[测试模式] 示波器锁定已模拟")
             return True, "TESTMODE"
 
-        try:
-            cached_resource = self.settings.value("scope_resource_str", "", type=str)
-            manual_resource = getattr(self, "scope_manual_resource", "")
-            device_info = discover_scope_resource_robust(
-                SERIAL_LOCK,
-                cached_resource=cached_resource,
-                manual_resource=manual_resource,
-            )
-            self.resource_str = device_info["resource"]
-            self.idn = device_info["idn"].strip()
-            self.profile_name = device_info["profile"].name
-            self.settings.setValue("scope_resource_str", self.resource_str)
-            parts = [x.strip() for x in self.idn.split(",")]
-            sn = parts[2] if len(parts) > 2 and parts[2] else self.idn
-            if verbose:
-                self.append_status(f"[示波器] 已锁定 [{sn}]")
-                self.append_status(f"[示波器] 型号: {self.profile_name}")
-                self.append_status(f"[示波器] 资源: {self.resource_str}")
-                self.append_status(f"[示波器] IDN: {self.idn}")
-            return True, sn
-        except Exception as e:
-            self.settings.remove("scope_resource_str")
-            self.resource_str = None
-            self.idn = None
-            self.profile_name = None
-            if verbose:
-                self.append_status(f"[示波器] 未连接或锁定失败: {e}")
-            if show_error:
-                QMessageBox.critical(self, "连接失败", f"无法锁定示波器\n\n{e}")
-            return False, "未连接"
+        errors = []
+        cached_resource = self.settings.value("scope_resource_str", "", type=str)
+        manual_resource = getattr(self, "scope_manual_resource", "")
+
+        for attempt in range(1, SCOPE_LOCK_ATTEMPTS + 1):
+            try:
+                if attempt > 1:
+                    QApplication.processEvents()
+                    time.sleep(min(0.8 * attempt, 3.0))
+                device_info = discover_scope_resource_robust(
+                    SERIAL_LOCK,
+                    cached_resource=cached_resource,
+                    manual_resource=manual_resource,
+                    connection_mode=self.scope_connection_mode,
+                )
+                self.resource_str = device_info["resource"]
+                self.idn = device_info["idn"].strip()
+                self.profile_name = device_info["profile"].name
+                self.settings.setValue("scope_resource_str", self.resource_str)
+                parts = [x.strip() for x in self.idn.split(",")]
+                sn = parts[2] if len(parts) > 2 and parts[2] else self.idn
+                if verbose:
+                    self.append_status(f"[示波器] 已锁定 [{sn}]")
+                    self.append_status(f"[示波器] 型号: {self.profile_name}")
+                    self.append_status(f"[示波器] 资源: {self.resource_str}")
+                    self.append_status(f"[示波器] IDN: {self.idn}")
+                return True, sn
+            except Exception as e:
+                errors.append(f"第{attempt}次: {e}")
+                if verbose:
+                    self.append_status(f"[示波器] 锁定失败（第{attempt}/{SCOPE_LOCK_ATTEMPTS}次）: {e}")
+                for resource in (self.resource_str, cached_resource):
+                    if resource:
+                        force_clear_scope_resource(resource)
+                if attempt == 1:
+                    cached_resource = ""
+
+        self.settings.remove("scope_resource_str")
+        self.resource_str = None
+        self.idn = None
+        self.profile_name = None
+        error_text = "\n".join(errors[-3:])
+        if verbose:
+            self.append_status(f"[示波器] 未连接或锁定失败，已重试 {SCOPE_LOCK_ATTEMPTS} 次")
+        if show_error:
+            QMessageBox.critical(self, "连接失败", f"无法锁定示波器\n\n{error_text}")
+        return False, "未连接"
 
     @staticmethod
     def _build_manual_axis_targets(text: str, name: str) -> list[dict]:
@@ -3281,8 +3945,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] RUN -> SINGLE")
                 else:
                     self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] RUN")
+            idx, save_path, screenshot_path = make_available_capture_paths(save_dir, start_idx + n, self.selected_channels, save_format)
+            self._scope_heartbeat(scope, reason=f"阶段 {stage_idx}/{stage_total} 循环 {cycle_no}/{cycles}")
             self.run_capture_once(scope, cycle_no, cycles)
-            idx = start_idx + n
             if TEST_MODE:
                 save_path, screenshot_path = self._write_test_capture_files(save_dir, idx, stage_idx, cycle_no)
                 saved_files.append(save_path)
@@ -3302,13 +3967,14 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 "scope": getattr(scope.profile, "name", ""),
             }
             base_time = None
-            save_path = os.path.join(save_dir, make_filename(idx, self.selected_channels, save_format))
-            screenshot_path = os.path.join(save_dir, make_screenshot_filename(idx, self.selected_channels))
-            save_scope_screenshot(scope, screenshot_path)
-            if LOG_CAPTURE_DETAIL:
-                self.append_status(
-                    f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] 截屏完成: {screenshot_path}"
-                )
+            if scope.profile.name != "DPO2024B" or DPO2024B_SAVE_SCREENSHOT:
+                save_scope_screenshot(scope, screenshot_path)
+                if LOG_CAPTURE_DETAIL:
+                    self.append_status(
+                        f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] 截屏完成: {screenshot_path}"
+                    )
+            elif LOG_CAPTURE_DETAIL:
+                self.append_status(f"[DPO2024B][阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] 已跳过截屏以降低USB掉线概率")
 
             for ch in sorted(self.selected_channels):
                 self._check_task_control()
@@ -3332,16 +3998,15 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
             save_waveform_file(save_path, waveform_data, save_format=save_format, meta=waveform_meta)
             saved_files.append(save_path)
-            if LOG_CAPTURE_DETAIL:
-                self.append_status(f"[阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] SAVE完成: {save_path}")
+            self.append_status(f"[寿命][阶段 {stage_idx}/{stage_total}][循环 {cycle_no}/{cycles}] 已保存: {save_path}")
             QApplication.processEvents()
         first_idx = start_idx
-        last_idx = start_idx + cycles - 1
+        last_idx = idx
         mode_text = "测试模式" if TEST_MODE else "示波器"
         self.append_status(
-            f"[{mode_text}][阶段 {stage_idx}/{stage_total}] 采集完成: {cycles} 组，文件编号 T{first_idx:04d}-T{last_idx:04d}"
+            f"[{mode_text}][阶段 {stage_idx}/{stage_total}] 采集完成: {cycles} 组，起始请求 T{first_idx:04d}，最后保存 T{last_idx:04d}"
         )
-        return saved_files, start_idx + cycles
+        return saved_files, idx + 1
 
     def request_task_stop(self):
         if not self.task_running:
@@ -3408,9 +4073,20 @@ class MainWindow(LaserLifetimeCalibrationUI):
             self._finish_task_ui()
             return
 
-        scope_ok, hot_ok, _ = self._auto_initialize_for_start()
-        if not scope_ok:
+        calibration_mode = self.get_calibration_mode()
+        needs_scope, needs_spectrometer = self._current_mode_device_requirements()
+
+        scope_ok, hot_ok, sig_ok, spec_ok = self._auto_initialize_for_start()
+        if needs_scope and not scope_ok:
             QMessageBox.warning(self, "提示", "示波器未连接，无法开始")
+            self._finish_task_ui()
+            return
+        if needs_spectrometer and not spec_ok:
+            QMessageBox.warning(self, "提示", "光谱仪未连接，无法开始")
+            self._finish_task_ui()
+            return
+        if not sig_ok:
+            QMessageBox.warning(self, "提示", "信号发生器未连接，无法开始")
             self._finish_task_ui()
             return
         if (self.temp_cal_btn.isChecked() or self.press_cal_btn.isChecked()) and not hot_ok:
@@ -3421,8 +4097,9 @@ class MainWindow(LaserLifetimeCalibrationUI):
         try:
             self._init_run_log_files(save_dir)
             self.data_log_enabled = True
-            self.append_data("自动寿命标定开始")
-            self.append_status("自动寿命标定开始")
+            mode_text = self.calibration_mode_combo.currentText()
+            self.append_data(f"自动{mode_text}开始")
+            self.append_status(f"自动{mode_text}开始")
             stages = self._build_stage_targets()
             cycles = int(self.cycles_spin.value())
             if cycles < 1:
@@ -3434,7 +4111,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
             capture_mode = self.get_capture_mode()
             save_format = self.get_save_format()
             self.append_status(
-                f"[任务] 自动流程启动: 阶段数={len(stages)}, 每阶段循环={cycles}, 模式={capture_mode}, 保存格式={save_format}"
+                f"[任务] 自动流程启动: 标定模式={mode_text}, 阶段数={len(stages)}, "
+                f"每阶段循环={cycles}, 模式={capture_mode}, 保存格式={save_format}"
             )
 
             saved_files = []
@@ -3454,16 +4132,43 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 self.append_status(f"[阶段 {i}/{stage_total}] 目标: 温度={t_txt}, 压力={p_txt}")
 
                 self._apply_stage_setpoints_and_wait(stage)
-                self.wait_light_source_stable()
+
+                if calibration_mode == "SPECTRUM":
+                    self._configure_siggen_spectrum_light()
+                    self.wait_light_source_stable("开始光谱保存")
+                    for spectrum_cycle in range(1, cycles + 1):
+                        self._check_task_control()
+                        spectrum_path = self._capture_spectrum_for_stage(
+                            save_dir,
+                            stage,
+                            i,
+                            stage_total,
+                            cycle_no=spectrum_cycle,
+                            cycle_total=cycles,
+                        )
+                        saved_files.append(spectrum_path)
+                        self.append_status(
+                            f"[光谱][阶段 {i}/{stage_total}][循环 {spectrum_cycle}/{cycles}] 已保存: {spectrum_path}"
+                        )
+                        QApplication.processEvents()
+                    try:
+                        self._set_siggen_output(False)
+                    except Exception as ex:
+                        self.append_status(f"[信号发生器] 关闭输出失败: {ex}")
+                    continue
+
+                self._configure_siggen_lifetime_light()
+                self.wait_light_source_stable("开始示波器保存")
+
                 stage_start_idx = start_idx
-                stage_end_target = stage_start_idx + cycles
                 self.append_status(
                     f"[测量开始][阶段 {i}/{stage_total}] 循环={cycles}，模式={capture_mode}，"
-                    f"温度={t_txt}，压力={p_txt}，文件编号 T{stage_start_idx:04d}-T{stage_end_target - 1:04d}"
+                    f"温度={t_txt}，压力={p_txt}，起始编号 T{stage_start_idx:04d}"
                 )
                 remaining = cycles
                 resume_attempts = 0
                 max_resume_attempts = 6
+                stage_files = []
                 while remaining > 0:
                     rm_stage = scope_stage = None
                     try:
@@ -3473,9 +4178,10 @@ class MainWindow(LaserLifetimeCalibrationUI):
                         )
                         if not TEST_MODE:
                             self.apply_acquire_settings(scope_stage)
-                        _, start_idx = self._run_scope_cycles_for_stage(
+                        new_files, start_idx = self._run_scope_cycles_for_stage(
                             scope_stage, save_dir, start_idx, remaining, i, stage_total
                         )
+                        stage_files.extend(new_files)
                         remaining = 0
                     except TaskStoppedError:
                         raise
@@ -3490,13 +4196,13 @@ class MainWindow(LaserLifetimeCalibrationUI):
                             f"[示波器] 正在自动重连并断点续采（第 {resume_attempts}/{max_resume_attempts} 次）..."
                         )
                         recovered_idx = max(start_idx, next_index(save_dir))
-                        progressed = recovered_idx - start_idx
+                        progressed = max(0, recovered_idx - start_idx)
                         if progressed > 0:
                             self.append_status(
                                 f"[示波器] 已检测到本阶段新增 {progressed} 个文件，按断点继续"
                             )
                         start_idx = recovered_idx
-                        remaining = max(0, stage_end_target - start_idx)
+                        remaining = max(0, cycles - len(stage_files) - progressed)
                         if remaining > 0:
                             self._recover_scope_connection(
                                 f"阶段 {i}/{stage_total} 断点续采",
@@ -3508,11 +4214,25 @@ class MainWindow(LaserLifetimeCalibrationUI):
                             rm_stage, scope_stage, reason=f"阶段 {i}/{stage_total} 子流程结束"
                         )
 
-                stage_files = [
-                    os.path.join(save_dir, make_filename(idx, self.selected_channels, save_format))
-                    for idx in range(stage_start_idx, min(start_idx, stage_end_target))
-                ]
                 saved_files.extend(stage_files)
+                if calibration_mode == "LIFETIME_SPECTRUM":
+                    self._configure_siggen_spectrum_light()
+                    self.wait_light_source_stable("开始光谱保存")
+                    for spectrum_cycle in range(1, cycles + 1):
+                        self._check_task_control()
+                        spectrum_path = self._capture_spectrum_for_stage(
+                            save_dir,
+                            stage,
+                            i,
+                            stage_total,
+                            cycle_no=spectrum_cycle,
+                            cycle_total=cycles,
+                        )
+                        saved_files.append(spectrum_path)
+                        self.append_status(
+                            f"[联合标定][阶段 {i}/{stage_total}][光谱循环 {spectrum_cycle}/{cycles}] 已保存: {spectrum_path}"
+                        )
+                        QApplication.processEvents()
                 try:
                     self._set_siggen_output(False)
                 except Exception as ex:
@@ -3523,8 +4243,16 @@ class MainWindow(LaserLifetimeCalibrationUI):
             summary = "\n".join(saved_files[:6])
             if len(saved_files) > 6:
                 summary += f"\n... 共 {len(saved_files)} 个文件"
-            completion_msg = f"已完成 {stage_total} 个阶段，每阶段 {cycles} 次采集\n{summary}"
-            if self.fit_enable_btn.isChecked():
+            if calibration_mode == "SPECTRUM":
+                completion_msg = f"已完成 {stage_total} 个阶段，每阶段 {cycles} 张光谱\n{summary}"
+            elif calibration_mode == "LIFETIME_SPECTRUM":
+                completion_msg = f"已完成 {stage_total} 个阶段，每阶段 {cycles} 次寿命采集 + {cycles} 张光谱\n{summary}"
+            else:
+                completion_msg = f"已完成 {stage_total} 个阶段，每阶段 {cycles} 次采集\n{summary}"
+            if calibration_mode == "SPECTRUM":
+                QMessageBox.information(self, "保存完成", completion_msg)
+                self.append_status("[后处理] 光谱标定完成，跳过寿命拟合")
+            elif self.fit_enable_btn.isChecked():
                 self.append_status(f"[任务] {completion_msg}")
                 self.append_status("[后处理] 自动启动寿命拟合全部文件结果保存")
                 fit_win, csv_files = self._prepare_info_fit_context(save_dir)
