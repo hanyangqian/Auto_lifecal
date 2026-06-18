@@ -1,5 +1,7 @@
 from pathlib import Path
-from typing import Dict, List, Tuple
+from decimal import Decimal, ROUND_HALF_UP
+import re
+from typing import Dict, List, Tuple, Union
 
 import matplotlib.pyplot as plt
 
@@ -8,36 +10,14 @@ import matplotlib.pyplot as plt
 # User settings
 # =========================
 SCRIPT_DIR = Path(__file__).resolve().parent
-
-# Set INPUT_DIR to the folder containing OceanView .txt spectra files.
-# If INPUT_FILES is not empty, only those files will be processed.
 INPUT_DIR = SCRIPT_DIR
-INPUT_FILES: List[Path] = []
-FILE_PATTERN = "*.txt"
 
-DATA_START_MARKER = ">>>>>Begin Spectral Data<<<<<"
-FILE_ENCODING = "gb18030"
-BACKGROUND_PREFIX = "back"
-
-# Keep this empty to process BACKGROUND_PREFIX plus numeric temperature prefixes.
-# Example: ALLOWED_SAMPLE_PREFIXES = ["25", "50", "75"]
-ALLOWED_SAMPLE_PREFIXES: List[str] = []
-REQUIRE_NUMERIC_TEMPERATURE_PREFIX = True
-
-OUTPUT_DIR = INPUT_DIR
-OUTPUT_NAME = "temperature_spectra.png"
-
+# Plot range and line style.
 X_MIN = 500
 X_MAX = 900
-FIGURE_WIDTH = 6.0
-FIGURE_HEIGHT = 4.5
 LINE_WIDTH = 0.8
 
-MATERIAL_LABEL = r"Al$_2$O$_3$:Cr" + "\n" + "Ex=395 nm"
-MATERIAL_LABEL_X = 0.03
-MATERIAL_LABEL_Y = 0.95
-MATERIAL_LABEL_FONT_SIZE = 12
-
+# Legend.
 SHOW_LEGEND = True
 LEGEND_LOCATION = "upper right"
 LEGEND_FONT_SIZE = 9
@@ -47,12 +27,20 @@ LEGEND_BORDER_PAD = 0.2
 LEGEND_FRAME_ON = False
 LEGEND_LABEL_TEMPLATE = r"{temperature} $^\circ$C"
 
+# Figure size and output.
+FIGURE_WIDTH = 6.0
+FIGURE_HEIGHT = 4.5
+SAVE_DPI = 300
+
+# Axis labels and material annotation.
 X_LABEL = "Wavelength (nm)"
 Y_LABEL = "Counts"
 AXIS_LABEL_FONT_SIZE = 12
 TICK_LABEL_SIZE = 10
-
-SAVE_DPI = 300
+MATERIAL_LABEL = r"Al$_2$O$_3$:Cr" + "\n" + "Ex=395 nm"
+MATERIAL_LABEL_X = 0.03
+MATERIAL_LABEL_Y = 0.95
+MATERIAL_LABEL_FONT_SIZE = 12
 
 COLORS = [
     "#1A1A1A",
@@ -67,21 +55,64 @@ COLORS = [
     "#BCBD22",
 ]
 
+# Default folder used when the runtime prompt is left empty.
+# If INPUT_FILES is not empty, only those files will be processed.
+
+INPUT_FILES: List[Path] = []
+FILE_PATTERN = "*.txt"
+PROMPT_FOR_INPUT_DIR = True
+
+DATA_START_MARKER = ">>>>>Begin Spectral Data<<<<<"
+FILE_ENCODING = "gb18030"
+WAVELENGTH_QUANTUM = Decimal("0.001")
+WAVELENGTH_TOLERANCE = 0.0015
+BACKGROUND_PREFIX = "back"
+MAIN_WINDOW_SPECTRUM_PREFIX_RE = re.compile(
+    r"^(?P<temperature>[+-]?\d+(?:\.\d+)?)C_(?P<pressure>(?:[+-]?\d+(?:\.\d+)?|current))kPa(?:_|$)",
+    re.IGNORECASE,
+)
+
+# Keep this empty to process BACKGROUND_PREFIX plus numeric temperature prefixes.
+# Example: ALLOWED_SAMPLE_PREFIXES = ["25", "50", "75"]
+ALLOWED_SAMPLE_PREFIXES: List[str] = []
+REQUIRE_NUMERIC_TEMPERATURE_PREFIX = True
+
+# Set to None to save the figure into the selected input folder.
+OUTPUT_DIR = None
+OUTPUT_NAME = "temperature_spectra.png"
+
 
 # =========================
 # Processing logic
 # =========================
-def resolve_path(path: Path) -> Path:
+def resolve_path(path: Union[str, Path]) -> Path:
+    path = Path(path)
     if path.is_absolute():
         return path
     return SCRIPT_DIR / path
 
 
-def collect_input_files() -> List[Path]:
+def prompt_input_dir() -> Path:
+    if not PROMPT_FOR_INPUT_DIR:
+        return resolve_path(INPUT_DIR)
+
+    try:
+        raw_path = input(f"Input spectra folder [{resolve_path(INPUT_DIR)}]: ").strip()
+    except EOFError:
+        raw_path = ""
+
+    raw_path = raw_path.strip('"')
+    return resolve_path(raw_path) if raw_path else resolve_path(INPUT_DIR)
+
+
+def collect_input_files(input_dir: Path) -> List[Path]:
     if INPUT_FILES:
         return sorted(resolve_path(file_path) for file_path in INPUT_FILES)
 
-    input_dir = resolve_path(INPUT_DIR)
+    if input_dir.is_file():
+        raise FileNotFoundError(f"INPUT_DIR must be a folder, not a file: {input_dir}")
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
     return sorted(input_dir.glob(FILE_PATTERN))
 
 
@@ -105,7 +136,7 @@ def read_spectrum(file_path: Path) -> Tuple[List[float], List[float]]:
             if len(parts) < 2:
                 continue
 
-            wavelengths.append(float(parts[0]))
+            wavelengths.append(float(Decimal(parts[0]).quantize(WAVELENGTH_QUANTUM, rounding=ROUND_HALF_UP)))
             counts.append(float(parts[1]))
 
     if not wavelengths:
@@ -130,7 +161,7 @@ def average_spectra(file_paths: List[Path]) -> Tuple[List[float], List[float]]:
             raise ValueError(f"Point count mismatch: {file_path.name}")
 
         for point_index, wavelength in enumerate(wavelengths):
-            if abs(wavelength - wavelengths_ref[point_index]) > 1e-6:
+            if abs(wavelength - wavelengths_ref[point_index]) > WAVELENGTH_TOLERANCE:
                 raise ValueError(f"Wavelength axis mismatch: {file_path.name}")
             sum_counts[point_index] += counts[point_index]
 
@@ -138,10 +169,29 @@ def average_spectra(file_paths: List[Path]) -> Tuple[List[float], List[float]]:
     return wavelengths_ref, averaged_counts
 
 
+def normalize_temperature_prefix(prefix: str) -> str:
+    try:
+        return f"{float(prefix):g}"
+    except ValueError:
+        return prefix
+
+
+def spectrum_group_key(file_path: Path) -> str:
+    stem = file_path.stem
+    if stem == BACKGROUND_PREFIX or stem.startswith(f"{BACKGROUND_PREFIX}_"):
+        return BACKGROUND_PREFIX
+
+    main_window_match = MAIN_WINDOW_SPECTRUM_PREFIX_RE.match(stem)
+    if main_window_match:
+        return normalize_temperature_prefix(main_window_match.group("temperature"))
+
+    return normalize_temperature_prefix(stem.split("_", 1)[0])
+
+
 def collect_groups(txt_files: List[Path]) -> Dict[str, List[Path]]:
     groups: Dict[str, List[Path]] = {}
     for file_path in txt_files:
-        prefix = file_path.stem.split("_", 1)[0]
+        prefix = spectrum_group_key(file_path)
         groups.setdefault(prefix, []).append(file_path)
     return groups
 
@@ -250,13 +300,14 @@ def plot_temperature_spectra(
 
 
 def main() -> None:
-    txt_files = collect_input_files()
+    input_dir = prompt_input_dir()
+    txt_files = collect_input_files(input_dir)
     if not txt_files:
-        raise FileNotFoundError("No spectral data files found. Check INPUT_DIR, INPUT_FILES, and FILE_PATTERN.")
+        raise FileNotFoundError(f"No spectral data files found in {input_dir}. Check FILE_PATTERN.")
 
     groups = filter_groups(collect_groups(txt_files))
     if BACKGROUND_PREFIX not in groups:
-        raise FileNotFoundError("No background files with prefix 'back' were found.")
+        raise FileNotFoundError(f"No background files with prefix 'back' were found in {input_dir}.")
 
     background_wavelengths, background_counts = average_spectra(groups[BACKGROUND_PREFIX])
     temperature_groups: Dict[str, List[float]] = {}
@@ -270,15 +321,16 @@ def main() -> None:
             raise ValueError(f"Point count mismatch between background and {prefix}.")
 
         for point_index, wavelength in enumerate(wavelengths):
-            if abs(wavelength - background_wavelengths[point_index]) > 1e-6:
+            if abs(wavelength - background_wavelengths[point_index]) > WAVELENGTH_TOLERANCE:
                 raise ValueError(f"Wavelength axis mismatch between background and {prefix}.")
 
         temperature_groups[prefix] = subtract_background(counts, background_counts)
+        print(f"Averaged {len(file_paths)} spectra for {prefix} C")
 
     if not temperature_groups:
         raise ValueError("No temperature spectra available for plotting.")
 
-    output_dir = resolve_path(OUTPUT_DIR)
+    output_dir = input_dir if OUTPUT_DIR is None else resolve_path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / OUTPUT_NAME
     plot_temperature_spectra(background_wavelengths, temperature_groups, output_path)
