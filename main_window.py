@@ -1186,15 +1186,31 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 file.write(f"{official_wavelength}\t{float(intensity):.0f}\n")
         return save_path
 
-    def _capture_spectrum_txt(self, save_path: str, metadata: dict[str, str]) -> str:
+    def _capture_spectrum_for_stage(
+        self,
+        save_dir: str,
+        stage: dict,
+        stage_idx: int,
+        stage_total: int,
+        cycle_no: int | None = None,
+        cycle_total: int | None = None,
+    ) -> str:
         integration_ms = int(self.spectrum_integration_ms)
         integration_us = integration_ms * 1000
         average_count = max(1, int(self.spectrum_average_count))
+        prefix = self._spectrum_filename_prefix(stage)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        save_path = os.path.join(save_dir, f"{prefix}_{stamp}.txt")
+
         metadata = {
             "created_at": datetime.now().isoformat(timespec="milliseconds"),
             "integration_time_us": str(integration_us),
             "scans_to_average": str(average_count),
-            **metadata,
+            "calibration_mode": self.get_calibration_mode(),
+            "stage": f"{stage_idx}/{stage_total}",
+            "cycle": "" if cycle_no is None or cycle_total is None else f"{cycle_no}/{cycle_total}",
+            "temperature_C": "" if stage.get("temp") is None else f"{float(stage.get('temp')):g}",
+            "pressure_kPa": "" if stage.get("press") is None else f"{float(stage.get('press')):g}",
         }
 
         if TEST_MODE:

@@ -11,6 +11,26 @@ import matplotlib.pyplot as plt
 # =========================
 SCRIPT_DIR = Path(__file__).resolve().parent
 INPUT_DIR = SCRIPT_DIR
+INPUT_FILES: List[Path] = []
+FILE_PATTERN = "*.txt"
+
+DATA_START_MARKER = ">>>>>Begin Spectral Data<<<<<"
+FILE_ENCODING = "gb18030"
+WAVELENGTH_QUANTUM = Decimal("0.001")
+WAVELENGTH_TOLERANCE = 0.0015
+BACKGROUND_PREFIX = "back"
+MAIN_WINDOW_SPECTRUM_PREFIX_RE = re.compile(
+    r"^(?P<temperature>[+-]?\d+(?:\.\d+)?)C_(?P<pressure>(?:[+-]?\d+(?:\.\d+)?|current))kPa(?:_|$)",
+    re.IGNORECASE,
+)
+
+# Keep this empty to process BACKGROUND_PREFIX plus numeric temperature prefixes.
+# Example: ALLOWED_SAMPLE_PREFIXES = ["25", "50", "75"]
+ALLOWED_SAMPLE_PREFIXES: List[str] = []
+REQUIRE_NUMERIC_TEMPERATURE_PREFIX = True
+
+OUTPUT_DIR = INPUT_DIR
+OUTPUT_NAME = "temperature_spectra.png"
 
 # Plot range and line style.
 X_MIN = 500
@@ -183,9 +203,9 @@ def spectrum_group_key(file_path: Path) -> str:
 
     main_window_match = MAIN_WINDOW_SPECTRUM_PREFIX_RE.match(stem)
     if main_window_match:
-        return normalize_temperature_prefix(main_window_match.group("temperature"))
+        return main_window_match.group("temperature")
 
-    return normalize_temperature_prefix(stem.split("_", 1)[0])
+    return stem.split("_", 1)[0]
 
 
 def collect_groups(txt_files: List[Path]) -> Dict[str, List[Path]]:
