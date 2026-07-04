@@ -337,7 +337,7 @@ class LaserLifetimeCalibrationUI(QWidget):
 
         temp_grid.addWidget(QLabel("参考温度 (°C):"), 0, 0)
         self.ref_temp_spin = QDoubleSpinBox()
-        self.ref_temp_spin.setRange(-50, 800)
+        self.ref_temp_spin.setRange(-200, 800)
         self.ref_temp_spin.setValue(25.0)
         self.ref_temp_spin.setDecimals(1)
         temp_grid.addWidget(self.ref_temp_spin, 0, 1)

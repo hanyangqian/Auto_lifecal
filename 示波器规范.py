@@ -830,11 +830,10 @@ def save_waveform_npz(save_path: str, data: dict, meta=None):
 
 def save_waveform_csv(save_path: str, data: dict):
     """
-    保存为 CSV，保持 pandas 默认写法：
-    不指定 float_format，不做 %.10g / %.12g 等人为精度格式限制。
+    保存为 CSV，按示波器U盘导出的显示习惯保留 5 位小数。
     """
     df = pd.DataFrame(data)
-    df.to_csv(save_path, index=False)
+    df.to_csv(save_path, index=False, float_format="%.5f")
 
 
 def save_waveform_file(save_path: str, data: dict, save_format="NPZ", meta=None):
@@ -1663,7 +1662,7 @@ class MainWindow(QWidget):
                     "scope_profile": self.profile_name,
                     "scope_resource": self.resource_str,
                     "scope_idn": self.idn,
-                    "format": "npz_lossless_numpy_arrays" if save_format == "NPZ" else "csv_pandas_default",
+                    "format": "npz_lossless_numpy_arrays" if save_format == "NPZ" else "csv_float_format_5",
                     "compression": "none" if save_format == "NPZ" else "N/A",
                     "channel_meta": meta_by_channel,
                 },
@@ -1681,7 +1680,7 @@ class MainWindow(QWidget):
                 (
                     "保存格式: NPZ无压缩二进制，保持numpy数组原始dtype，无文本精度截断"
                     if save_format == "NPZ"
-                    else "保存格式: CSV，pandas默认to_csv，未指定float_format"
+                    else "保存格式: CSV，float_format=%.5f"
                 ),
             ]
             for ch, elapsed, npts in channel_timings:

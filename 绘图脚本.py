@@ -10,6 +10,34 @@ import matplotlib.pyplot as plt
 # User settings
 # =========================
 SCRIPT_DIR = Path(__file__).resolve().parent
+INPUT_DIR = SCRIPT_DIR
+INPUT_FILES: List[Path] = []
+FILE_PATTERN = "*.txt"
+
+DATA_START_MARKER = ">>>>>Begin Spectral Data<<<<<"
+FILE_ENCODING = "gb18030"
+WAVELENGTH_QUANTUM = Decimal("0.001")
+WAVELENGTH_TOLERANCE = 0.0015
+BACKGROUND_PREFIX = "back"
+MAIN_WINDOW_SPECTRUM_PREFIX_RE = re.compile(
+    r"^(?P<temperature>[+-]?\d+(?:\.\d+)?)C_(?P<pressure>(?:[+-]?\d+(?:\.\d+)?|current))kPa(?:_|$)",
+    re.IGNORECASE,
+)
+
+# Keep this empty to process BACKGROUND_PREFIX plus numeric temperature prefixes.
+# Example: ALLOWED_SAMPLE_PREFIXES = ["25", "50", "75"]
+ALLOWED_SAMPLE_PREFIXES: List[str] = []
+REQUIRE_NUMERIC_TEMPERATURE_PREFIX = True
+
+OUTPUT_DIR = INPUT_DIR
+OUTPUT_NAME = "temperature_spectra.png"
+
+# Plot range and line style.
+X_MIN = 500
+X_MAX = 900
+LINE_WIDTH = 0.8
+
+# Legend.
 INPUT_DIR = r"C:\Users\16567\Desktop\袁\260608\Al2O3_0.2%Cr2O3"
 
 # Plot range and line style.
@@ -37,10 +65,8 @@ X_LABEL = "Wavelength (nm)"
 Y_LABEL = "Counts"
 AXIS_LABEL_FONT_SIZE = 12
 TICK_LABEL_SIZE = 10
-MATERIAL_LABEL = r"Al2O3_0.2%Cr2O3"# + "\n" +"Ex=395 nm"
-MATERIAL_LABEL_X = 0.03
-MATERIAL_LABEL_Y = 0.95
-MATERIAL_LABEL_FONT_SIZE = 12
+
+SAVE_DPI = 300
 
 COLORS = [
     "#1A1A1A",
@@ -54,32 +80,6 @@ COLORS = [
     "#E377C2",
     "#BCBD22",
 ]
-
-# Default folder used when the runtime prompt is left empty.
-# If INPUT_FILES is not empty, only those files will be processed.
-INPUT_DIR = SCRIPT_DIR
-INPUT_FILES: List[Path] = []
-FILE_PATTERN = "*.txt"
-PROMPT_FOR_INPUT_DIR = False
-
-DATA_START_MARKER = ">>>>>Begin Spectral Data<<<<<"
-FILE_ENCODING = "gb18030"
-WAVELENGTH_QUANTUM = Decimal("0.001")
-WAVELENGTH_TOLERANCE = 0.0015
-BACKGROUND_PREFIX = "back"
-MAIN_WINDOW_SPECTRUM_PREFIX_RE = re.compile(
-    r"^(?P<temperature>[+-]?\d+(?:\.\d+)?)C_(?P<pressure>(?:[+-]?\d+(?:\.\d+)?|current))kPa(?:_|$)",
-    re.IGNORECASE,
-)
-
-# Keep this empty to process BACKGROUND_PREFIX plus numeric temperature prefixes.
-# Example: ALLOWED_SAMPLE_PREFIXES = ["25", "50", "75"]
-ALLOWED_SAMPLE_PREFIXES: List[str] = []
-REQUIRE_NUMERIC_TEMPERATURE_PREFIX = True
-
-# Set to None to save the figure into the selected input folder.
-OUTPUT_DIR = None
-OUTPUT_NAME = "temperature_spectra.png"
 
 
 # =========================
@@ -109,8 +109,7 @@ def collect_input_files(input_dir: Path) -> List[Path]:
     if INPUT_FILES:
         return sorted(resolve_path(file_path) for file_path in INPUT_FILES)
 
-    if not input_dir.is_dir():
-        raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
+    input_dir = resolve_path(INPUT_DIR)
     return sorted(input_dir.glob(FILE_PATTERN))
 
 
@@ -305,7 +304,7 @@ def main() -> None:
 
     groups = filter_groups(collect_groups(txt_files))
     if BACKGROUND_PREFIX not in groups:
-        raise FileNotFoundError("No background files with prefix 'back' were found.")
+        raise FileNotFoundError(f"No background files with prefix 'back' were found in {input_dir}.")
 
     background_wavelengths, background_counts = average_spectra(groups[BACKGROUND_PREFIX])
     temperature_groups: Dict[str, List[float]] = {}

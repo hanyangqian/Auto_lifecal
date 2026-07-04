@@ -16,6 +16,7 @@ import sys
 import time
 import traceback
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 from PyQt5.QtCore import QThread, QTimer, pyqtSignal
@@ -38,6 +39,7 @@ from PyQt5.QtWidgets import (
 
 
 DATA_START_MARKER = ">>>>>Begin Spectral Data<<<<<"
+WAVELENGTH_QUANTUM = Decimal("0.001")
 
 
 def load_seabreeze(backend: str | None = None):
@@ -74,7 +76,8 @@ def save_spectrum(path: Path, wavelengths, intensities, metadata: dict[str, str]
             file.write(f"# {key}: {value}\n")
         file.write(f"{DATA_START_MARKER}\n")
         for wavelength, intensity in zip(wavelengths, intensities):
-            file.write(f"{float(wavelength):.6f}\t{float(intensity):.6f}\n")
+            official_wavelength = Decimal(str(float(wavelength))).quantize(WAVELENGTH_QUANTUM, rounding=ROUND_HALF_UP)
+            file.write(f"{official_wavelength}\t{float(intensity):.0f}\n")
 
 
 def timestamp_name(prefix: str, index: int, total: int, suffix: str) -> str:
