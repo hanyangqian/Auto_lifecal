@@ -1118,9 +1118,12 @@ class MainWindow(LaserLifetimeCalibrationUI):
         self.init_btn.clicked.connect(self.initialize_system)
         self.spectrum_preview_btn = QPushButton("光谱实时")
         self.spectrum_preview_btn.clicked.connect(self.open_spectrum_preview)
+        self.capture_back_spectrum_btn = QPushButton("采集BACK")
+        self.capture_back_spectrum_btn.clicked.connect(self.capture_background_spectrum)
         action_layout = self.init_btn.parentWidget().layout()
         if action_layout is not None:
             action_layout.insertWidget(1, self.spectrum_preview_btn, 1)
+            action_layout.insertWidget(2, self.capture_back_spectrum_btn, 1)
         self.start_btn.setCheckable(False)
         self.start_btn.clicked.connect(self.on_run_pause_clicked)
         self.stop_btn.clicked.connect(self.request_task_stop)
@@ -1183,31 +1186,15 @@ class MainWindow(LaserLifetimeCalibrationUI):
                 file.write(f"{official_wavelength}\t{float(intensity):.0f}\n")
         return save_path
 
-    def _capture_spectrum_for_stage(
-        self,
-        save_dir: str,
-        stage: dict,
-        stage_idx: int,
-        stage_total: int,
-        cycle_no: int | None = None,
-        cycle_total: int | None = None,
-    ) -> str:
+    def _capture_spectrum_txt(self, save_path: str, metadata: dict[str, str]) -> str:
         integration_ms = int(self.spectrum_integration_ms)
         integration_us = integration_ms * 1000
         average_count = max(1, int(self.spectrum_average_count))
-        prefix = self._spectrum_filename_prefix(stage)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        save_path = os.path.join(save_dir, f"{prefix}_{stamp}.txt")
-
         metadata = {
             "created_at": datetime.now().isoformat(timespec="milliseconds"),
             "integration_time_us": str(integration_us),
             "scans_to_average": str(average_count),
-            "calibration_mode": self.get_calibration_mode(),
-            "stage": f"{stage_idx}/{stage_total}",
-            "cycle": "" if cycle_no is None or cycle_total is None else f"{cycle_no}/{cycle_total}",
-            "temperature_C": "" if stage.get("temp") is None else f"{float(stage.get('temp')):g}",
-            "pressure_kPa": "" if stage.get("press") is None else f"{float(stage.get('press')):g}",
+            **metadata,
         }
 
         if TEST_MODE:
@@ -1239,6 +1226,65 @@ class MainWindow(LaserLifetimeCalibrationUI):
                     spectrometer.close()
             except Exception:
                 pass
+
+    def _capture_spectrum_for_stage(
+        self,
+        save_dir: str,
+        stage: dict,
+        stage_idx: int,
+        stage_total: int,
+        cycle_no: int | None = None,
+        cycle_total: int | None = None,
+    ) -> str:
+        prefix = self._spectrum_filename_prefix(stage)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        save_path = os.path.join(save_dir, f"{prefix}_{stamp}.txt")
+
+        metadata = {
+            "calibration_mode": self.get_calibration_mode(),
+            "stage": f"{stage_idx}/{stage_total}",
+            "cycle": "" if cycle_no is None or cycle_total is None else f"{cycle_no}/{cycle_total}",
+            "temperature_C": "" if stage.get("temp") is None else f"{float(stage.get('temp')):g}",
+            "pressure_kPa": "" if stage.get("press") is None else f"{float(stage.get('press')):g}",
+        }
+
+        return self._capture_spectrum_txt(save_path, metadata)
+
+    def _capture_background_spectrum(self, save_dir: str) -> str:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        save_path = os.path.join(save_dir, f"back_{stamp}.txt")
+        return self._capture_spectrum_txt(
+            save_path,
+            {
+                "calibration_mode": "BACKGROUND",
+                "stage": "",
+                "cycle": "",
+                "temperature_C": "",
+                "pressure_kPa": "",
+            },
+        )
+
+    def capture_background_spectrum(self):
+        if self.task_running:
+            QMessageBox.warning(self, "提示", "自动任务运行中，不能单独采集 BACK 光谱")
+            return
+
+        save_dir = self.save_path_edit.text().strip()
+        if not save_dir:
+            QMessageBox.warning(self, "提示", "请先选择保存路径")
+            return
+
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            self.persist_save_path()
+            saved_path = self._capture_background_spectrum(save_dir)
+        except Exception as ex:
+            QMessageBox.warning(self, "采集BACK失败", str(ex))
+            self.append_status(f"[光谱][BACK] 采集失败: {ex}")
+            return
+
+        self.append_status(f"[光谱][BACK] 已保存: {saved_path}")
+        QMessageBox.information(self, "BACK光谱已保存", saved_path)
 
     def get_spectrometer_identity_status(self):
         if TEST_MODE:
@@ -1332,7 +1378,7 @@ class MainWindow(LaserLifetimeCalibrationUI):
 
     def _manual_axis_defaults(self, axis: str):
         if axis == "temp":
-            return "温度", "℃", "℃/min", -50.0, 800.0, "新建升温"
+            return "温度", "℃", "℃/min", -200.0, 800.0, "新建升温"
         return "压力", "kPa", "kPa/min", 0.0, 5000.0, "新建升压"
 
     def _default_axis_segments(self, axis: str) -> list[dict]:
@@ -3808,6 +3854,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
             need_temp=need_temp,
             need_press=need_press,
             reason=reason,
+            temp_target=stage.get("temp"),
+            press_target=stage.get("press"),
             temp_tol=stage.get("temp_tol"),
             press_tol=stage.get("press_tol"),
             temp_hold_s=stage.get("temp_hold_s"),
@@ -4523,6 +4571,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         need_temp=None,
         need_press=None,
         reason: str = "",
+        temp_target: float | None = None,
+        press_target: float | None = None,
         temp_tol: float | None = None,
         press_tol: float | None = None,
         temp_hold_s: float | None = None,
@@ -4535,8 +4585,8 @@ class MainWindow(LaserLifetimeCalibrationUI):
         if not need_temp and not need_press:
             return
 
-        temp_target = float(self.ref_temp_spin.value())
-        press_target = float(self.ref_press_spin.value())
+        temp_target = float(self.ref_temp_spin.value() if temp_target is None else temp_target)
+        press_target = float(self.ref_press_spin.value() if press_target is None else press_target)
         temp_tol = float(DEFAULT_TEMP_TOL if temp_tol is None else temp_tol)
         press_tol = float(DEFAULT_PRESS_TOL if press_tol is None else press_tol)
         temp_hold_s = float(DEFAULT_TEMP_HOLD_S if temp_hold_s is None else temp_hold_s)

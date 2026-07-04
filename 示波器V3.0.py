@@ -30,7 +30,7 @@ from PyQt5.QtCore import Qt, QTimer, QSettings
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QMessageBox,
     QFileDialog, QDialog, QDialogButtonBox, QCheckBox, QLabel, QHBoxLayout,
-    QLineEdit, QComboBox
+    QLineEdit, QComboBox, QSpinBox
 )
 
 
@@ -53,6 +53,11 @@ SAVE_STOP_SETTLE_S = 0
 # 状态刷新参数
 STATUS_POLL_INTERVAL_MS = 500
 STATUS_POLL_MAX_ERRORS = 5
+
+# 连续 SINGLE 保存参数
+# 每次循环流程：SINGLE -> 等待示波器停止 -> 保存一次。
+AUTO_SINGLE_POLL_INTERVAL_S = 0.20
+AUTO_SINGLE_WAIT_TIMEOUT_S = 600
 
 
 # =========================
@@ -758,7 +763,15 @@ def read_waveform_mdo34(scope, ch_name: str):
 # =========================
 # File naming / indexing
 # =========================
-FNAME_RE = re.compile(r"^T(\d{4})(CH[1-4](?:CH[1-4])*)?\.(?:CSV|NPZ)$", re.IGNORECASE)
+# 同时兼容：
+# 1) 修正后的 T0001CH1.npz / T0001CH1.csv；
+# 2) 旧版本已经生成的 T0001CH1.NPZ；
+# 3) 旧版本因 np.savez 自动补后缀生成的 T0001CH1.NPZ.npz。
+# 这样旧文件也会参与编号计算，避免继续从旧编号开始覆盖。
+FNAME_RE = re.compile(
+    r"^T(\d{4})(?:CH[1-4])*\.(?:csv|npz)(?:\.npz)?$",
+    re.IGNORECASE,
+)
 
 
 def next_index(save_dir: str) -> int:
@@ -783,7 +796,10 @@ def normalize_save_format(save_format):
 
 def make_filename(idx: int, channels, save_format="NPZ") -> str:
     suffix = "".join(sorted(channels))
-    ext = normalize_save_format(save_format)
+    fmt = normalize_save_format(save_format)
+    # np.savez 只把小写 .npz 当成已有后缀；如果写成 .NPZ，
+    # 它会自动变成 .NPZ.npz。这里统一生成小写后缀。
+    ext = "npz" if fmt == "NPZ" else "csv"
     return f"T{idx:04d}{suffix}.{ext}"
 
 
@@ -796,13 +812,20 @@ def save_waveform_npz(save_path: str, data: dict, meta=None):
     - 不做文本格式化；
     - 不做 %.10g / %.12g 之类的精度截断；
     - 不压缩，优先保证速度和原始数组精度。
+
+    重要：这里用文件句柄写入，而不是直接把路径字符串交给 np.savez。
+    原因是 np.savez 对后缀大小写敏感：T0000CH1.NPZ 会被实际保存为
+    T0000CH1.NPZ.npz，导致 next_index 扫描不到旧文件，从而重复编号并覆盖。
     """
     arrays = {}
     for name, values in data.items():
         arrays[name] = np.asarray(values)
     if meta is not None:
         arrays["__meta_json__"] = np.asarray(json.dumps(meta, ensure_ascii=False, indent=2))
-    np.savez(save_path, **arrays)
+
+    # 用文件对象可以保证实际写入路径就是 save_path，不会被 numpy 悄悄追加 .npz。
+    with open(save_path, "wb") as f:
+        np.savez(f, **arrays)
 
 
 def save_waveform_csv(save_path: str, data: dict):
@@ -845,6 +868,7 @@ class MainWindow(QWidget):
         self._save_rm = None
         self._save_scope = None
         self._save_resource_str = None
+        self.is_auto_saving = False
 
         self.status_refresh_errors = 0
 
@@ -895,9 +919,23 @@ class MainWindow(QWidget):
         ch_fmt_layout.addWidget(self.save_format_combo)
         layout.addLayout(ch_fmt_layout)
 
+        save_action_layout = QHBoxLayout()
         self.btn_save = QPushButton("保存NPZ")
         self.btn_save.clicked.connect(self.do_save)
-        layout.addWidget(self.btn_save)
+        save_action_layout.addWidget(self.btn_save, 1)
+
+        save_action_layout.addWidget(QLabel("连续次数:"))
+        self.auto_save_count_spin = QSpinBox()
+        self.auto_save_count_spin.setRange(1, 999)
+        self.auto_save_count_spin.setValue(1)
+        self.auto_save_count_spin.setToolTip("每次执行：SINGLE 一次 -> 等待停止 -> 保存一次")
+        save_action_layout.addWidget(self.auto_save_count_spin)
+
+        self.btn_auto_single_save = QPushButton("连续SINGLE保存")
+        self.btn_auto_single_save.clicked.connect(self.do_auto_single_save)
+        save_action_layout.addWidget(self.btn_auto_single_save, 1)
+
+        layout.addLayout(save_action_layout)
         self.on_save_format_changed()
 
         ctrl_layout = QHBoxLayout()
@@ -1511,18 +1549,18 @@ class MainWindow(QWidget):
             self.selected_channels = sel
             self.btn_ch.setText("通道：" + ",".join(sorted(self.selected_channels)))
 
-    def do_save(self):
+    def _check_save_ready(self, ask_average: bool = True) -> bool:
         if self.save_dir and not os.path.isdir(self.save_dir):
             self.save_dir = None
             self.persist_save_path()
             self.refresh_save_path_button()
         if not self.save_dir:
             QMessageBox.warning(self, "提示", "请先选择保存文件夹")
-            return
+            return False
         if not self.resource_str:
             QMessageBox.warning(self, "提示", "设备未锁定，无法保存")
-            return
-        if self.awaiting_run_after_apply and self.current_acq_mode == "AVERAGE":
+            return False
+        if ask_average and self.awaiting_run_after_apply and self.current_acq_mode == "AVERAGE":
             ans = QMessageBox.question(
                 self,
                 "尚未运行",
@@ -1531,8 +1569,16 @@ class MainWindow(QWidget):
                 QMessageBox.No,
             )
             if ans != QMessageBox.Yes:
-                return
+                return False
+        return True
 
+    def _save_current_waveform(self, show_done_box: bool = True):
+        """
+        保存当前示波器内存中的波形。
+
+        注意：这个函数只负责保存，不负责触发 SINGLE。
+        连续保存时外层先执行 SINGLE 并等待停止，然后调用这里保存一次。
+        """
         os.makedirs(self.save_dir, exist_ok=True)
         idx = next_index(self.save_dir)
         save_format = normalize_save_format(self.save_format_combo.currentData())
@@ -1560,6 +1606,7 @@ class MainWindow(QWidget):
             open_elapsed = time.perf_counter() - t_open0
 
             # Save path uses the detected profile's fixed stop command only.
+            # 连续保存外层已经等到 SINGLE 停止，这里再次 STOP 只是保险，不会提前截断采集。
             t_stop0 = time.perf_counter()
             _w(scope, scope.profile.acq_stop_cmd)
             time.sleep(SAVE_STOP_SETTLE_S)
@@ -1644,24 +1691,30 @@ class MainWindow(QWidget):
             print(f"[保存计时] 完成: {save_path}", flush=True)
 
             self.show_notice("保存完成", save_path)
-            done_box = QMessageBox(self)
-            done_box.setWindowTitle("保存完成")
-            done_box.setIcon(QMessageBox.NoIcon)
-            done_box.setText(
-                "已保存：\n"
-                + save_path
-                + "\n\n"
-                + "\n".join(debug_lines)
-                + "\n\n保存计时：\n"
-                + "\n".join(timing_lines)
-            )
-            done_box.exec_()
+            if show_done_box:
+                done_box = QMessageBox(self)
+                done_box.setWindowTitle("保存完成")
+                done_box.setIcon(QMessageBox.NoIcon)
+                done_box.setText(
+                    "已保存：\n"
+                    + save_path
+                    + "\n\n"
+                    + "\n".join(debug_lines)
+                    + "\n\n保存计时：\n"
+                    + "\n".join(timing_lines)
+                )
+                done_box.exec_()
 
-        except Exception as e:
+            return save_path, debug_lines, timing_lines
+
+        except Exception:
             save_failed = True
             total_elapsed = time.perf_counter() - save_t0
-            print(f"[保存计时] 保存失败，已耗时: {total_elapsed:.3f} s，错误: {e}", flush=True)
-            QMessageBox.critical(self, "保存失败", f"{e}\n\n{traceback.format_exc()}")
+            print(
+                f"[保存计时] 保存失败，已耗时: {total_elapsed:.3f} s，错误: {traceback.format_exc()}",
+                flush=True,
+            )
+            raise
 
         finally:
             # 成功时保留保存专用会话，下次保存复用。
@@ -1669,6 +1722,172 @@ class MainWindow(QWidget):
             if save_failed:
                 self.close_persistent_save_session()
 
+    def do_save(self):
+        if not self._check_save_ready(ask_average=True):
+            return
+
+        try:
+            self._save_current_waveform(show_done_box=True)
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"{e}\n\n{traceback.format_exc()}")
+
+    def _set_auto_save_controls_enabled(self, enabled: bool):
+        widgets = [
+            self.btn_usb_connect,
+            self.btn_lan_connect,
+            self.btn_path,
+            self.btn_ch,
+            self.save_format_combo,
+            self.btn_save,
+            self.btn_auto_single_save,
+            self.auto_save_count_spin,
+            self.btn_run,
+            self.btn_stop,
+            self.btn_single,
+            self.btn_acquire,
+            self.cmd_input,
+            self.cmd_send,
+        ]
+        for w in widgets:
+            try:
+                w.setEnabled(enabled)
+            except Exception:
+                pass
+
+    def _start_single_and_wait_until_stop(self, current_i: int, total_n: int):
+        rm = scope = None
+        rm, scope, reused_session = self.get_persistent_save_scope()
+
+        _w(scope, scope.profile.stopafter_single_cmd)
+        _w(scope, scope.profile.acq_run_cmd)
+        self.awaiting_run_after_apply = False
+        self.current_stopafter = "SEQ"
+
+        start_t = time.perf_counter()
+        last_acq = None
+
+        while True:
+            QApplication.processEvents()
+
+            acq = self.query_acquire_status(scope)
+            last_acq = acq
+            self.current_acq_mode = acq["mode"]
+            self.current_numavg = acq["numavg"]
+            self.current_stopafter = acq["stopafter"]
+
+            if acq["mode"] == "AVERAGE":
+                progress = self._average_progress_from_numacq(acq)
+                extra = [
+                    f"连续保存：第 {current_i}/{total_n} 次",
+                    f"采集模式：{acq['mode']}",
+                    f"平均进度：{progress}/{acq['numavg']}",
+                ]
+            else:
+                extra = [
+                    f"连续保存：第 {current_i}/{total_n} 次",
+                    f"采集模式：{acq['mode']}",
+                ]
+
+            if self._is_scope_running(acq):
+                extra.append(f"状态：SINGLE 运行中，等待停止 ({acq['trig_state']})")
+            else:
+                extra.append(f"状态：SINGLE 已停止，准备保存 ({acq['trig_state']})")
+
+            extra.append(f"原始状态：STATE={acq['state']} TRIG={acq['trig_state']} NUMACQ={acq['numacq']}")
+            self.update_status_label(extra)
+
+            if not self._is_scope_running(acq):
+                break
+
+            if time.perf_counter() - start_t > AUTO_SINGLE_WAIT_TIMEOUT_S:
+                raise RuntimeError(
+                    f"第 {current_i}/{total_n} 次 SINGLE 等待超时。\n"
+                    f"已等待 {AUTO_SINGLE_WAIT_TIMEOUT_S} 秒，但示波器仍未停止。"
+                )
+
+            time.sleep(AUTO_SINGLE_POLL_INTERVAL_S)
+
+        return last_acq
+
+    def do_auto_single_save(self):
+        if self.is_auto_saving:
+            return
+        if not self._check_save_ready(ask_average=False):
+            return
+
+        total_n = int(self.auto_save_count_spin.value())
+        ans = QMessageBox.question(
+            self,
+            "连续SINGLE保存",
+            f"将连续执行 {total_n} 次：\n\n"
+            "SINGLE 一次 -> 等待示波器停止 -> 保存一次\n\n"
+            "是否开始？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        self.is_auto_saving = True
+        self.progress_timer.stop()
+        self._set_auto_save_controls_enabled(False)
+
+        saved_paths = []
+        auto_t0 = time.perf_counter()
+
+        try:
+            for i in range(1, total_n + 1):
+                self.update_status_label([
+                    f"连续保存：第 {i}/{total_n} 次",
+                    "状态：正在启动 SINGLE",
+                ])
+                print(f"[连续保存] 第 {i}/{total_n} 次：启动 SINGLE", flush=True)
+
+                self._start_single_and_wait_until_stop(i, total_n)
+
+                self.update_status_label([
+                    f"连续保存：第 {i}/{total_n} 次",
+                    "状态：SINGLE 已停止，正在保存",
+                ])
+                save_path, debug_lines, timing_lines = self._save_current_waveform(show_done_box=False)
+                saved_paths.append(save_path)
+
+                self.update_status_label([
+                    f"连续保存：第 {i}/{total_n} 次完成",
+                    f"已保存：{save_path}",
+                    f"进度：{i}/{total_n}",
+                ])
+                print(f"[连续保存] 第 {i}/{total_n} 次完成：{save_path}", flush=True)
+
+            total_elapsed = time.perf_counter() - auto_t0
+            show_list = "\n".join(saved_paths[-12:])
+            if len(saved_paths) > 12:
+                show_list = f"...\n{show_list}"
+
+            QMessageBox.information(
+                self,
+                "连续保存完成",
+                f"已完成 {len(saved_paths)}/{total_n} 次连续 SINGLE 保存。\n\n"
+                f"总耗时：{total_elapsed:.3f} s\n\n"
+                f"保存文件：\n{show_list}"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "连续保存失败",
+                f"已完成 {len(saved_paths)}/{total_n} 次。\n\n"
+                f"错误：{e}\n\n{traceback.format_exc()}"
+            )
+            self.close_persistent_save_session()
+
+        finally:
+            self.is_auto_saving = False
+            self._set_auto_save_controls_enabled(True)
+            self.update_status_label([
+                f"连续保存结束：{len(saved_paths)}/{total_n}",
+                "状态：空闲",
+            ])
 
 
     def closeEvent(self, event):
